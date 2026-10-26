@@ -11,9 +11,12 @@
 """
 import datetime
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
+
+import auto  # 内嵌核心刷课逻辑（打包后随本程序一起分发）
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont
@@ -28,24 +31,26 @@ AUTO_PY = os.path.join(BASE_DIR, "auto.py")
 PROGRESS_FILE = os.path.join(BASE_DIR, "progress.json")
 LOG_FILE = os.path.join(BASE_DIR, "log.txt")
 
-# 打包（PyInstaller）后：脚本/解释器路径换成同目录的 auto.exe
+# 打包（PyInstaller）后：不再调用外部 exe，直接用 multiprocessing 拉起内嵌的 auto 逻辑
 FROZEN = bool(getattr(sys, "frozen", False))
 if FROZEN:
     BASE_DIR = os.path.dirname(sys.executable)
     PYTHON = None
-    AUTO_EXE = os.path.join(BASE_DIR, "auto.exe")
-    AUTO_PY = os.path.join(BASE_DIR, "auto.py")
     PROGRESS_FILE = os.path.join(BASE_DIR, "progress.json")
     LOG_FILE = os.path.join(BASE_DIR, "log.txt")
 else:
     PYTHON = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
-    AUTO_EXE = None
+
+
+def auto_runner(argv):
+    """子进程入口：执行内嵌刷课逻辑（spawn 目标，须为模块级函数）"""
+    auto.main(argv)
 
 
 def auto_cmd(extra_args):
-    """构造调用 auto 脚本的命令：源码环境用 venv python，打包后直接用同目录 auto.exe"""
+    """构造调用 auto 的参数：源码环境用 venv python，打包后 spawn 内嵌逻辑"""
     if FROZEN:
-        return [AUTO_EXE] + extra_args
+        return extra_args
     return [PYTHON, AUTO_PY] + extra_args
 
 QSS = """
@@ -304,63 +309,66 @@ class Console(QMainWindow):
             self.status_lbl.setStyleSheet("color: #d29922; font-size: 14px; font-weight: bold;")
 
     # ---------- 控制 ----------
+    def launch_runner(self, extra_args, mode_label):
+        """启动刷课/检查逻辑：源码环境 subprocess 调 venv python；打包后 multiprocessing spawn 内嵌逻辑"""
+        if self.proc is not None and self.proc.poll() is None:
+            self.append_log_note("已有任务在运行，请先点“停止”。")
+            return False
+        args = auto_cmd(extra_args)
+        if FROZEN:
+            try:
+                mp_ctx = multiprocessing.get_context("spawn")
+                self.proc = mp_ctx.Process(target=auto_runner, args=(args,))
+                self.proc.start()
+            except Exception as e:
+                self.append_log_note(f"启动失败: {e}")
+                return False
+        else:
+            try:
+                self.proc = subprocess.Popen(
+                    [PYTHON, AUTO_PY] + extra_args, cwd=BASE_DIR,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception as e:
+                self.append_log_note(f"启动失败: {e}")
+                return False
+        self.append_log_note(f"已启动：{' '.join(extra_args)}（{mode_label}）")
+        return True
+
     def start(self):
         """刷课模式：完整播放每个视频"""
         if self.proc is not None and self.proc.poll() is None:
             self.append_log_note("已有任务在运行，请先点“停止”。")
             return
-        if FROZEN:
-            runner = AUTO_EXE
-        else:
-            runner = AUTO_PY
-        if not os.path.exists(runner):
-            self.append_log_note(f"找不到脚本：{runner}")
+        if not FROZEN and not os.path.exists(AUTO_PY):
+            self.append_log_note(f"找不到脚本：{AUTO_PY}")
             return
         n = self.lessons_box.currentText()
         pn = self.parallel_box.currentText()
-        cmd = auto_cmd([])
+        extra = []
         if n != "全部":
-            cmd += ["--max-lessons", n]
+            extra += ["--max-lessons", n]
         if pn != "1":
-            cmd += ["--parallel", pn]
-        try:
-            self.proc = subprocess.Popen(
-                cmd, cwd=BASE_DIR,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except Exception as e:
-            self.append_log_note(f"启动失败: {e}")
+            extra += ["--parallel", pn]
+        if not self.launch_runner(extra, f"刷课模式，每门 {n} 条，并行 {pn} 窗口"):
             return
         self.running_mode = "刷课"
         self.status_lbl.setText("刷课中…")
         self.status_lbl.setStyleSheet("color: #d29922; font-size: 14px; font-weight: bold;")
-        self.append_log_note(f"已启动：{' '.join(cmd)}（刷课模式，每门 {n} 条，并行 {pn} 窗口）")
 
     def check_status(self):
         """检查模式：快速遍历所有课程，解析目标并刷新进度记录（不播放）"""
         if self.proc is not None and self.proc.poll() is None:
             self.append_log_note("已有任务在运行，请先点“停止”。")
             return
-        if FROZEN:
-            runner = AUTO_EXE
-        else:
-            runner = AUTO_PY
-        if not os.path.exists(runner):
-            self.append_log_note(f"找不到脚本：{runner}")
+        if not FROZEN and not os.path.exists(AUTO_PY):
+            self.append_log_note(f"找不到脚本：{AUTO_PY}")
             return
-        cmd = auto_cmd(["--quick"])
-        try:
-            self.proc = subprocess.Popen(
-                cmd, cwd=BASE_DIR,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except Exception as e:
-            self.append_log_note(f"启动失败: {e}")
+        if not self.launch_runner(["--quick"], "检查模式：遍历刷新进度，不播放"):
             return
         self.running_mode = "检查"
         self.status_lbl.setText("检查中…")
         self.status_lbl.setStyleSheet("color: #5b6ee1; font-size: 14px; font-weight: bold;")
-        self.append_log_note(f"已启动：{' '.join(cmd)}（检查模式：遍历刷新进度，不播放）")
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:
@@ -370,11 +378,12 @@ class Console(QMainWindow):
                 pass
             self.proc = None
         ps = r"""
-$ps = Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'msedge|python' }
-foreach ($p in $ps) {
-    $cl = $p.CommandLine
-    if ($cl -match 'yuketang_auto') { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+$ps = Get-CimInstance Win32_Process | Where-Object {
+    ($_.Name -match 'yuketang') -or
+    ($_.Name -match 'msedge' -and $_.CommandLine -match 'edge_profile') -or
+    ($_.Name -match 'python' -and $_.CommandLine -match 'yuketang')
 }
+foreach ($p in $ps) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
 """
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=30,
@@ -401,4 +410,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # PyInstaller 打包后 multiprocessing spawn 子进程需要此行，否则子进程会重复打开窗口
+    multiprocessing.freeze_support()
     main()

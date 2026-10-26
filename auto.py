@@ -49,12 +49,14 @@ INDEX_URL = "https://www.yuketang.cn/v2/web/index"
 
 
 def log(msg):
+    line = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}"
+    # 控制台可能不存在（打包后的 windowed 子进程），print 需容错
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if sys.stdout is not None:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            print(line, flush=True)
     except Exception:
         pass
-    line = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -893,7 +895,7 @@ def ensure_parallel_profiles(parallel):
             log(f"【profile】复制失败: {str(e)[:150]}")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="雨课堂自动刷课（跨课程，视频+计分+未完成）")
     ap.add_argument("--course", default=None, help="课程名（模糊匹配），只刷该课程；不填则刷所有课程")
     ap.add_argument("--dwell", type=int, default=10, help="课件每页停留秒数（默认 10，视频用不到）")
@@ -904,7 +906,7 @@ def main():
     ap.add_argument("--parallel", type=int, default=1, choices=[1, 2, 3],
                     help="同时刷课的课程数（最多 3，默认 1）")
     ap.add_argument("--status", action="store_true", help="只查看进度记录，不刷课")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     log("=== 雨课堂自动刷课脚本 v7 启动 ===")
 
@@ -1007,4 +1009,4 @@ def main():
 if __name__ == "__main__":
     # PyInstaller 打包后 multiprocessing spawn 需要此行，否则并行子进程会重复执行主程序
     multiprocessing.freeze_support()
-    main()
+    main(sys.argv[1:] if len(sys.argv) > 1 else None)
