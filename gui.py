@@ -21,7 +21,7 @@ import webbrowser
 
 import auto  # 内嵌核心刷课逻辑（打包后随本程序一起分发）
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.1"        # 每次发新版前手动递增
+APP_VERSION = "1.0.2"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -111,6 +111,9 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 
 
 class Console(QMainWindow):
+    # 跨线程信号：后台检查线程发现新版本 → 主线程弹窗
+    update_found = Signal(str, str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("雨课堂刷课控制台")
@@ -120,6 +123,7 @@ class Console(QMainWindow):
         self.proc = None
         self.running_mode = ""
         self.last_log_size = 0
+        self.update_found.connect(self._show_update_dialog)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -222,7 +226,7 @@ class Console(QMainWindow):
                 if result:
                     tag, url = result
                     if _ver_tuple(tag) > _ver_tuple(APP_VERSION):
-                        QTimer.singleShot(0, lambda: self._show_update_dialog(tag, url))
+                        self.update_found.emit(tag, url)
             except Exception:
                 pass
         threading.Thread(target=worker, daemon=True).start()
