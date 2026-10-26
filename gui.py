@@ -11,7 +11,7 @@
 """
 import datetime
 import json
-import multiprocessing
+import multiprocessing  # 仅用于 freeze_support（auto 内部并行 spawn）
 import os
 import subprocess
 import sys
@@ -31,7 +31,8 @@ AUTO_PY = os.path.join(BASE_DIR, "auto.py")
 PROGRESS_FILE = os.path.join(BASE_DIR, "progress.json")
 LOG_FILE = os.path.join(BASE_DIR, "log.txt")
 
-# 打包（PyInstaller）后：不再调用外部 exe，直接用 multiprocessing 拉起内嵌的 auto 逻辑
+# 打包（PyInstaller）后：单文件双模式 —— 双击=GUI；GUI 内部用 subprocess 调自身
+# （--auto-cli 参数）跑刷课逻辑，与 GUI 完全隔离，互不干扰
 FROZEN = bool(getattr(sys, "frozen", False))
 if FROZEN:
     BASE_DIR = os.path.dirname(sys.executable)
@@ -41,16 +42,14 @@ if FROZEN:
 else:
     PYTHON = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
 
-
-def auto_runner(argv):
-    """子进程入口：执行内嵌刷课逻辑（spawn 目标，须为模块级函数）"""
-    auto.main(argv)
+# CLI 模式标志：打包后 subprocess 调用自身时附加，入口据此直接跑刷课逻辑
+CLI_FLAG = "--auto-cli"
 
 
 def auto_cmd(extra_args):
-    """构造调用 auto 的参数：源码环境用 venv python，打包后 spawn 内嵌逻辑"""
+    """构造调用 auto 的命令：源码环境用 venv python；打包后调自身（--auto-cli）"""
     if FROZEN:
-        return extra_args
+        return [sys.executable, CLI_FLAG] + extra_args
     return [PYTHON, AUTO_PY] + extra_args
 
 QSS = """
@@ -310,28 +309,20 @@ class Console(QMainWindow):
 
     # ---------- 控制 ----------
     def launch_runner(self, extra_args, mode_label):
-        """启动刷课/检查逻辑：源码环境 subprocess 调 venv python；打包后 multiprocessing spawn 内嵌逻辑"""
+        """启动刷课/检查逻辑：源码环境 subprocess 调 venv python；打包后 subprocess 调自身（--auto-cli）。
+        刷课逻辑运行在独立进程，与 GUI 完全隔离。"""
         if self.proc is not None and self.proc.poll() is None:
             self.append_log_note("已有任务在运行，请先点“停止”。")
             return False
-        args = auto_cmd(extra_args)
-        if FROZEN:
-            try:
-                mp_ctx = multiprocessing.get_context("spawn")
-                self.proc = mp_ctx.Process(target=auto_runner, args=(args,))
-                self.proc.start()
-            except Exception as e:
-                self.append_log_note(f"启动失败: {e}")
-                return False
-        else:
-            try:
-                self.proc = subprocess.Popen(
-                    [PYTHON, AUTO_PY] + extra_args, cwd=BASE_DIR,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            except Exception as e:
-                self.append_log_note(f"启动失败: {e}")
-                return False
+        cmd = auto_cmd(extra_args)
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=BASE_DIR,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as e:
+            self.append_log_note(f"启动失败: {e}")
+            return False
         self.append_log_note(f"已启动：{' '.join(extra_args)}（{mode_label}）")
         return True
 
@@ -379,7 +370,7 @@ class Console(QMainWindow):
             self.proc = None
         ps = r"""
 $ps = Get-CimInstance Win32_Process | Where-Object {
-    ($_.Name -match 'yuketang') -or
+    ($_.Name -match 'yuketang' -and $_.CommandLine -match 'auto-cli') -or
     ($_.Name -match 'msedge' -and $_.CommandLine -match 'edge_profile') -or
     ($_.Name -match 'python' -and $_.CommandLine -match 'yuketang')
 }
@@ -410,6 +401,11 @@ def main():
 
 
 if __name__ == "__main__":
-    # PyInstaller 打包后 multiprocessing spawn 子进程需要此行，否则子进程会重复打开窗口
+    # 打包后 multiprocessing spawn 子进程需要此行（auto 内部并行用）
     multiprocessing.freeze_support()
+    # 单文件双模式：GUI 用 subprocess 调自身带 --auto-cli 参数时，直接跑刷课逻辑、不打开窗口
+    if FROZEN and CLI_FLAG in sys.argv:
+        args = [a for a in sys.argv[1:] if a != CLI_FLAG]
+        auto.main(args or None)
+        sys.exit(0)
     main()
