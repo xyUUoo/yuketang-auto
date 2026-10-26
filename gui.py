@@ -15,6 +15,9 @@ import multiprocessing  # 仅用于 freeze_support（auto 内部并行 spawn）
 import os
 import subprocess
 import sys
+import threading
+import urllib.request
+import webbrowser
 
 import auto  # 内嵌核心刷课逻辑（打包后随本程序一起分发）
 
@@ -22,9 +25,14 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
-    QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
+
+# ---- 版本与更新检查 ----
+APP_VERSION = "1.0.1"        # 每次发新版前手动递增
+GITHUB_REPO = "xyUUoo/yuketang-auto"
+GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTO_PY = os.path.join(BASE_DIR, "auto.py")
@@ -204,6 +212,150 @@ class Console(QMainWindow):
         self.timer.timeout.connect(self.refresh_all)
         self.timer.start(2000)
 
+        # 启动 3 秒后后台检查 GitHub 是否有新版本（失败静默）
+        QTimer.singleShot(3000, self._start_update_check)
+
+    def _start_update_check(self):
+        def worker():
+            try:
+                result = fetch_latest_release()
+                if result:
+                    tag, url = result
+                    if _ver_tuple(tag) > _ver_tuple(APP_VERSION):
+                        QTimer.singleShot(0, lambda: self._show_update_dialog(tag, url))
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_update_dialog(self, tag, url):
+        msg = QMessageBox()
+        msg.setWindowTitle("发现新版本")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText(
+            f"雨课堂刷课工具有新版本 **{tag}**\n\n"
+            f"当前版本：v{APP_VERSION}\n\n"
+            f"点击「下载更新」会自动下载并重启为新版，全程无需手动操作。"
+        )
+        ok_btn = msg.addButton("下载更新", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("忽略", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+        if msg.clickedButton() == ok_btn:
+            self._start_update(tag)
+
+    # ---------- 自动更新 ----------
+    def _start_update(self, tag):
+        if self.proc is not None and self.proc.poll() is None:
+            self.append_log_note("有刷课任务在运行，请先点“停止”后再更新。")
+            return
+        self._upd_tag = tag
+        self._upd_dlg = QDialog(self)
+        self._upd_dlg.setWindowTitle("正在更新")
+        self._upd_dlg.setFixedSize(440, 130)
+        lay = QVBoxLayout(self._upd_dlg)
+        self._upd_lbl = QLabel(f"正在下载新版本 {tag} …")
+        self._upd_lbl.setStyleSheet("color: #e6e6e6; font-size: 13px;")
+        self._upd_bar = QProgressBar()
+        self._upd_bar.setRange(0, 100)
+        self._upd_bar.setValue(0)
+        self._upd_bar.setFormat("%p%")
+        lay.addWidget(self._upd_lbl)
+        lay.addWidget(self._upd_bar)
+        self._upd_dlg.show()
+        threading.Thread(target=self._download_update_worker, args=(tag,), daemon=True).start()
+
+    def _download_update_worker(self, tag):
+        try:
+            url = f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/yuketang-gui.exe"
+            upd_dir = os.path.join(BASE_DIR, "update")
+            os.makedirs(upd_dir, exist_ok=True)
+            dest = os.path.join(upd_dir, "yuketang-gui.exe")
+            last_pct = -1
+            last_chunk = 0
+            for proxy in (None, "http://127.0.0.1:12450"):
+                try:
+                    if proxy:
+                        opener = urllib.request.build_opener(
+                            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+                    else:
+                        opener = urllib.request.build_opener()
+                    req = urllib.request.Request(url, headers={"User-Agent": "yuketang-auto-update"})
+                    with opener.open(req, timeout=30) as r:
+                        total = int(r.headers.get("Content-Length", 0) or 0)
+                        done = 0
+                        with open(dest, "wb") as f:
+                            while True:
+                                chunk = r.read(1 << 16)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                                done += len(chunk)
+                                if total:
+                                    pct = int(done * 100 / total)
+                                    if pct != last_pct:
+                                        last_pct = pct
+                                        QTimer.singleShot(0, lambda p=pct, d=done, t=total:
+                                                          self._upd_progress(p, d, t))
+                                elif done - last_chunk >= 512 * 1024:
+                                    last_chunk = done
+                                    QTimer.singleShot(0, lambda d=done: self._upd_progress(-1, d, 0))
+                    QTimer.singleShot(0, lambda: self._finish_update(dest))
+                    return
+                except Exception:
+                    try:
+                        os.remove(dest)
+                    except Exception:
+                        pass
+                    continue
+            QTimer.singleShot(0, lambda: self._upd_failed("网络不可用或下载失败"))
+        except Exception as e:
+            QTimer.singleShot(0, lambda: self._upd_failed(str(e)[:120]))
+
+    def _upd_progress(self, pct, done, total):
+        if pct >= 0:
+            self._upd_bar.setValue(pct)
+        self._upd_lbl.setText(
+            f"正在下载新版本 {self._upd_tag} … {done // 1048576}MB / {total // 1048576}MB")
+
+    def _finish_update(self, new_exe):
+        try:
+            bat = os.path.join(BASE_DIR, "update.bat")
+            content = (
+                "@echo off\r\n"
+                f'set "APP={os.path.join(BASE_DIR, "yuketang-gui.exe")}"\r\n'
+                f'set "NEW={new_exe}"\r\n'
+                "taskkill /f /im yuketang-gui.exe >nul 2>&1\r\n"
+                ":wait\r\n"
+                "timeout /t 1 /nobreak >nul\r\n"
+                'tasklist /fi "imagename eq yuketang-gui.exe" 2>nul | find /i "yuketang-gui" >nul && goto :wait\r\n'
+                'del /f /q "%APP%" >nul 2>&1\r\n'
+                'move /y "%NEW%" "%APP%" >nul 2>&1\r\n'
+                'start "" "%APP%"\r\n'
+                'del /f /q "%~f0" >nul 2>&1\r\n'
+                'rd /s /q "%~dp0update" >nul 2>&1\r\n'
+            )
+            with open(bat, "w", encoding="gbk") as f:
+                f.write(content)
+            subprocess.Popen(
+                ["cmd", "/c", bat],
+                cwd=BASE_DIR,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            self.append_log_note("更新包已就绪，程序将自动重启完成安装。")
+            self._upd_dlg.close()
+            QApplication.instance().quit()
+        except Exception as e:
+            self.append_log_note(f"安装更新失败: {e}")
+
+    def _upd_failed(self, err=""):
+        if getattr(self, "_upd_dlg", None) is not None:
+            self._upd_dlg.close()
+        msg = QMessageBox()
+        msg.setWindowTitle("更新失败")
+        msg.setText(f"下载更新失败：{err}\n\n可前往 GitHub Releases 手动下载。")
+        msg.addButton("前往下载", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+
     def _mk_label(self, text):
         lbl = QLabel(text)
         lbl.setStyleSheet("color: #9aa0b4; font-size: 13px;")
@@ -270,7 +422,7 @@ class Console(QMainWindow):
             elif done:
                 status, st_color = "已刷完 ✓", "#2ea043"
             elif is_running and name in running_names:
-                status, st_color = "刷课中", "#d29922"
+                status, st_color = ("检查中", "#5b6ee1") if self.running_mode == "检查" else ("刷课中", "#d29922")
             item_st = QTableWidgetItem(status)
             item_st.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             item_st.setForeground(QColor(st_color))
@@ -304,8 +456,9 @@ class Console(QMainWindow):
             self.status_lbl.setStyleSheet("color: #2ea043; font-size: 14px; font-weight: bold;")
         elif self.proc is not None:
             mode_txt = "检查中…" if getattr(self, "running_mode", "") == "检查" else "刷课中…"
+            mode_color = "#5b6ee1" if getattr(self, "running_mode", "") == "检查" else "#d29922"
             self.status_lbl.setText(mode_txt)
-            self.status_lbl.setStyleSheet("color: #d29922; font-size: 14px; font-weight: bold;")
+            self.status_lbl.setStyleSheet(f"color: {mode_color}; font-size: 14px; font-weight: bold;")
 
     # ---------- 控制 ----------
     def launch_runner(self, extra_args, mode_label):
@@ -389,6 +542,38 @@ foreach ($p in $ps) { Stop-Process -Id $p.ProcessId -Force -ErrorAction Silently
         self.log_view.appendPlainText(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {text}")
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+
+def _ver_tuple(tag):
+    """'v1.0.0' / '1.0.1' → (1, 0, 0)"""
+    out = []
+    for p in tag.lstrip("vV").split("."):
+        try:
+            out.append(int(p))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
+
+
+def fetch_latest_release():
+    """后台查询 GitHub 最新 Release；成功返回 (tag, release_url)，失败/无网返回 None"""
+    api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    for proxy in (None, "http://127.0.0.1:12450"):
+        try:
+            if proxy:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            else:
+                opener = urllib.request.build_opener()
+            req = urllib.request.Request(api, headers={"User-Agent": "yuketang-auto-check"})
+            with opener.open(req, timeout=6) as r:
+                data = json.loads(r.read().decode("utf-8"))
+                tag = data.get("tag_name", "")
+                if tag:
+                    return tag, data.get("html_url", GITHUB_RELEASE_URL)
+        except Exception:
+            continue
+    return None
 
 
 def main():

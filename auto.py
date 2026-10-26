@@ -652,12 +652,36 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
     return done, len(targets), total
 
 
+def win_toast(title, message):
+    """Windows 10+ 系统通知（右下角 toast）。纯 PowerShell + WinRT，无需额外模块。"""
+    try:
+        import subprocess
+        ps = r'''
+$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml('<toast><visual><binding template="ToastText02"><text id="1"><![CDATA[TITLE]]></text><text id="2"><![CDATA[MSG]]></text></binding></visual></toast>')
+$toast = New-Object Windows.UI.Notifications.ToastNotification($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('yuketang-auto').Show($toast)
+'''
+        title = title.replace("]]>", "]] >")
+        message = message.replace("]]>", "]] >")
+        ps = ps.replace("TITLE", title).replace("MSG", message)
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps], timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        pass
+
+
 def notify_done(prog, total_done, course_count):
-    """刷课结束弹窗（PySide6 深色风格，与控制台一致）"""
+    """刷课结束弹窗（PySide6 深色风格，与控制台一致），显示在屏幕顶部居中，并发送 Windows 通知"""
     log("========== 刷课结束 ==========")
     try:
         from PySide6.QtCore import Qt
-        from PySide6.QtGui import QColor, QFont
+        from PySide6.QtGui import QColor, QFont, QGuiApplication
         from PySide6.QtWidgets import (
             QApplication, QDialog, QHBoxLayout, QHeaderView, QLabel,
             QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
@@ -691,6 +715,12 @@ QPushButton:pressed { background-color: #4a5bc0; }
         dlg = QDialog()
         dlg.setWindowTitle("雨课堂刷课完成")
         dlg.setFixedSize(520, 420)
+        # 弹窗显示在屏幕顶部居中（避免 Qt 默认摆到屏幕底部）
+        try:
+            screen = QGuiApplication.primaryScreen().availableGeometry()
+            dlg.move(screen.x() + (screen.width() - 520) // 2, screen.y() + 24)
+        except Exception:
+            pass
 
         root = QVBoxLayout(dlg)
         root.setContentsMargins(20, 18, 20, 16)
@@ -742,6 +772,8 @@ QPushButton:pressed { background-color: #4a5bc0; }
         root.addLayout(btns)
 
         dlg.show()
+        # 同步发一条 Windows 系统通知（右下角 toast）
+        win_toast("雨课堂刷课完成", f"共处理 {course_count} 门课程，刷完 {total_done} 个视频条目。")
         app.exec()
     except Exception as e:
         # 极端环境下 PySide6 不可用则退回纯文字记录
@@ -975,6 +1007,8 @@ def main(argv=None):
     parallel = max(1, min(3, args.parallel))
     if args.course:
         parallel = 1  # 指定单门课程时不需要并行
+    if args.quick:
+        parallel = 1  # 检查模式固定单窗口，不受并行数影响
     if parallel > 1:
         ensure_parallel_profiles(parallel)
     init_task_pool(entries)
