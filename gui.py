@@ -24,13 +24,13 @@ import auto  # 内嵌核心刷课逻辑（打包后随本程序一起分发）
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
+    QApplication, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.3"        # 每次发新版前手动递增
+APP_VERSION = "1.0.4"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -267,29 +267,34 @@ class Console(QMainWindow):
         self._upd_log(f"开始更新 {tag}")
         self._upd_tag = tag
         # 右下角无边框小窗（置顶、不抢焦点）：正在下载 + 进度条
-        self._upd_dlg = QDialog(self)
-        self._upd_dlg.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self._upd_dlg.setFixedSize(320, 92)
-        lay = QVBoxLayout(self._upd_dlg)
-        lay.setContentsMargins(14, 10, 14, 10)
-        self._upd_lbl = QLabel(f"正在下载新版本 {tag} … 0MB")
-        self._upd_lbl.setStyleSheet("color: #e6e6e6; font-size: 12px;")
-        self._upd_bar = QProgressBar()
-        self._upd_bar.setRange(0, 100)
-        self._upd_bar.setValue(0)
-        self._upd_bar.setFormat("%p%")
-        lay.addWidget(self._upd_lbl)
-        lay.addWidget(self._upd_bar)
-        self._upd_dlg.setStyleSheet(
-            "QDialog { background-color: #262833; border: 1px solid #3a3d4d; border-radius: 8px; }")
         try:
-            screen = QGuiApplication.primaryScreen().availableGeometry()
-            self._upd_dlg.move(screen.x() + screen.width() - 340,
-                               screen.y() + screen.height() - 130)
-        except Exception:
-            pass
-        self._upd_dlg.show()
+            self._upd_dlg = QDialog(self)
+            self._upd_dlg.setWindowFlags(
+                Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+            self._upd_dlg.setFixedSize(320, 92)
+            lay = QVBoxLayout(self._upd_dlg)
+            lay.setContentsMargins(14, 10, 14, 10)
+            self._upd_lbl = QLabel(f"正在下载新版本 {tag} … 0MB")
+            self._upd_lbl.setStyleSheet("color: #e6e6e6; font-size: 12px;")
+            self._upd_bar = QProgressBar()
+            self._upd_bar.setRange(0, 100)
+            self._upd_bar.setValue(0)
+            self._upd_bar.setFormat("%p%")
+            lay.addWidget(self._upd_lbl)
+            lay.addWidget(self._upd_bar)
+            self._upd_dlg.setStyleSheet(
+                "QDialog { background-color: #262833; border: 1px solid #3a3d4d; border-radius: 8px; }")
+            try:
+                screen = QGuiApplication.primaryScreen().availableGeometry()
+                self._upd_dlg.move(screen.x() + screen.width() - 340,
+                                   screen.y() + screen.height() - 130)
+            except Exception:
+                pass
+            self._upd_dlg.show()
+            self._upd_log("小窗已显示")
+        except Exception as e:
+            self._upd_log(f"小窗创建失败(继续下载): {str(e)[:200]}")
+            self._upd_dlg = None
         threading.Thread(target=self._download_update_worker, args=(tag,), daemon=True).start()
 
     def _download_update_worker(self, tag):
@@ -374,7 +379,10 @@ class Console(QMainWindow):
             subprocess.Popen(
                 ["cmd", "/c", bat],
                 cwd=BASE_DIR,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    | getattr(subprocess, "DETACHED_PROCESS", 0)
+                ),
             )
             self.append_log_note("更新包已就绪，程序将自动重启完成安装。")
             if getattr(self, "_upd_dlg", None) is not None:
