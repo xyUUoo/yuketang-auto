@@ -381,15 +381,22 @@ class Console(QMainWindow):
                 "@echo off\r\n"
                 f'set "APP={os.path.join(BASE_DIR, "yuketang-gui.exe")}"\r\n'
                 f'set "NEW={new_exe}"\r\n'
-                "taskkill /f /im yuketang-gui.exe >nul 2>&1\r\n"
+                "set S=%SystemRoot%\\System32\r\n"
+                "%S%\\taskkill /f /im yuketang-gui.exe >nul 2>&1\r\n"
+                "set /a cnt=0\r\n"
                 ":wait\r\n"
-                "timeout /t 1 /nobreak >nul\r\n"
-                'tasklist /fi "imagename eq yuketang-gui.exe" 2>nul | find /i "yuketang-gui" >nul && goto :wait\r\n'
+                "%S%\\tasklist /fi \"imagename eq yuketang-gui.exe\" 2>nul | %S%\\findstr /r /c:\"^yuketang-gui\" >nul\r\n"
+                "if errorlevel 1 goto :dodel\r\n"
+                "set /a cnt+=1\r\n"
+                "if %cnt% geq 15 goto :dodel\r\n"
+                "%S%\\timeout /t 1 /nobreak >nul\r\n"
+                "goto :wait\r\n"
+                ":dodel\r\n"
                 'del /f /q "%APP%" >nul 2>&1\r\n'
                 'move /y "%NEW%" "%APP%" >nul 2>&1\r\n'
                 'start "" "%APP%"\r\n'
-                'del /f /q "%~f0" >nul 2>&1\r\n'
                 'rd /s /q "%~dp0update" >nul 2>&1\r\n'
+                'del /f /q "%~f0" >nul 2>&1\r\n'
             )
             with open(bat, "w", encoding="gbk") as f:
                 f.write(content)
