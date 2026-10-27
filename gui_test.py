@@ -24,7 +24,7 @@ import auto  # 内嵌核心刷课逻辑（打包后随本程序一起分发）
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
+    QApplication, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -379,7 +379,10 @@ class Console(QMainWindow):
             subprocess.Popen(
                 ["cmd", "/c", bat],
                 cwd=BASE_DIR,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    | getattr(subprocess, "DETACHED_PROCESS", 0)
+                ),
             )
             self.append_log_note("更新包已就绪，程序将自动重启完成安装。")
             if getattr(self, "_upd_dlg", None) is not None:

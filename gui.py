@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.4"        # 每次发新版前手动递增
+APP_VERSION = "1.0.5"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -285,9 +285,9 @@ class Console(QMainWindow):
             self._upd_dlg.setStyleSheet(
                 "QDialog { background-color: #262833; border: 1px solid #3a3d4d; border-radius: 8px; }")
             try:
-                screen = QGuiApplication.primaryScreen().availableGeometry()
-                self._upd_dlg.move(screen.x() + screen.width() - 340,
-                                   screen.y() + screen.height() - 130)
+                g = self.frameGeometry()
+                self._upd_dlg.move(g.x() + g.width() - 340,
+                                   g.y() + g.height() - 130)
             except Exception:
                 pass
             self._upd_dlg.show()
