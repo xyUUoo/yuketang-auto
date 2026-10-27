@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.6"        # 每次发新版前手动递增
+APP_VERSION = "1.0.7"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -545,11 +545,26 @@ class Console(QMainWindow):
     def start(self):
         """刷课模式：完整播放每个视频"""
         if self.proc is not None and self.proc.poll() is None:
-            self.append_log_note("已有任务在运行，请先点“停止”。")
+            self.append_log_note("已有任务在运行，请先点“结束”。")
             return
         if not FROZEN and not os.path.exists(AUTO_PY):
             self.append_log_note(f"找不到脚本：{AUTO_PY}")
             return
+        # 首次运行（还没有任何进度记录）：建议先检查状态
+        if not self._has_progress():
+            msg = QMessageBox()
+            msg.setWindowTitle("首次运行")
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setText(
+                "首次运行前建议先「检查状态」\n\n"
+                "检查会刷新课程与未完成数量，避免误判“已刷完”。"
+            )
+            btn_check = msg.addButton("去检查状态", QMessageBox.ButtonRole.AcceptRole)
+            btn_direct = msg.addButton("直接刷课", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            if msg.clickedButton() == btn_check:
+                self.check_status()
+                return
         n = self.lessons_box.currentText()
         pn = self.parallel_box.currentText()
         extra = []
@@ -563,10 +578,17 @@ class Console(QMainWindow):
         self.status_lbl.setText("刷课中…")
         self.status_lbl.setStyleSheet("color: #d29922; font-size: 14px; font-weight: bold;")
 
+    def _has_progress(self):
+        """是否已有进度记录（跑过检查/刷课）"""
+        try:
+            return os.path.exists(PROGRESS_FILE) and os.path.getsize(PROGRESS_FILE) > 0
+        except Exception:
+            return False
+
     def check_status(self):
         """检查模式：快速遍历所有课程，解析目标并刷新进度记录（不播放）"""
         if self.proc is not None and self.proc.poll() is None:
-            self.append_log_note("已有任务在运行，请先点“停止”。")
+            self.append_log_note("已有任务在运行，请先点“结束”。")
             return
         if not FROZEN and not os.path.exists(AUTO_PY):
             self.append_log_note(f"找不到脚本：{AUTO_PY}")

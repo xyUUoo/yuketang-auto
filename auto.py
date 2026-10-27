@@ -639,6 +639,14 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
     # 解析待办（异步加载，0 条时重试；页面显示“暂无未完成”则直接跳过）
     all_items, targets, state = refresh_todo_list(page)
     log(f"[{course_name}] 待办共 {len(all_items)} 条，目标（视频+计分+未完成）：{len(targets)} 条")
+    # 未完成条目类型分布（视频/课件/作业/其他，按页面原始类型文字统计）
+    type_cnt = {}
+    for it in all_items:
+        t = it.get("type", "其他") or "其他"
+        type_cnt[t] = type_cnt.get(t, 0) + 1
+    if type_cnt:
+        dist = " · ".join(f"{k}×{v}" for k, v in type_cnt.items())
+        log(f"[{course_name}] 未完成类型分布：{dist}")
     for i, t in enumerate(targets[:10]):
         log(f"  [{i}] {t['name']} ({t['status']})")
     if len(targets) > 10:
