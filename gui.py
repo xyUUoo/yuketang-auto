@@ -22,7 +22,7 @@ import webbrowser
 import auto  # 内嵌核心刷课逻辑（打包后随本程序一起分发）
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.2"        # 每次发新版前手动递增
+APP_VERSION = "1.0.3"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -111,8 +111,11 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 
 
 class Console(QMainWindow):
-    # 跨线程信号：后台检查线程发现新版本 → 主线程弹窗
+    # 跨线程信号：后台检查线程发现新版本 → 主线程弹窗；下载线程 → 主线程更新进度/收尾
     update_found = Signal(str, str)
+    upd_progress = Signal(int, int, int)   # pct, done, total
+    upd_finished = Signal(str)             # 下载完成，new_exe 路径
+    upd_error = Signal(str)                # 下载失败原因
 
     def __init__(self):
         super().__init__()
@@ -124,6 +127,9 @@ class Console(QMainWindow):
         self.running_mode = ""
         self.last_log_size = 0
         self.update_found.connect(self._show_update_dialog)
+        self.upd_progress.connect(self._upd_progress)
+        self.upd_finished.connect(self._finish_update)
+        self.upd_error.connect(self._upd_failed)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -247,27 +253,47 @@ class Console(QMainWindow):
             self._start_update(tag)
 
     # ---------- 自动更新 ----------
+    def _upd_log(self, text):
+        try:
+            with open(os.path.join(BASE_DIR, "update_dl.log"), "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {text}\n")
+        except Exception:
+            pass
+
     def _start_update(self, tag):
         if self.proc is not None and self.proc.poll() is None:
             self.append_log_note("有刷课任务在运行，请先点“停止”后再更新。")
             return
+        self._upd_log(f"开始更新 {tag}")
         self._upd_tag = tag
+        # 右下角无边框小窗（置顶、不抢焦点）：正在下载 + 进度条
         self._upd_dlg = QDialog(self)
-        self._upd_dlg.setWindowTitle("正在更新")
-        self._upd_dlg.setFixedSize(440, 130)
+        self._upd_dlg.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self._upd_dlg.setFixedSize(320, 92)
         lay = QVBoxLayout(self._upd_dlg)
-        self._upd_lbl = QLabel(f"正在下载新版本 {tag} …")
-        self._upd_lbl.setStyleSheet("color: #e6e6e6; font-size: 13px;")
+        lay.setContentsMargins(14, 10, 14, 10)
+        self._upd_lbl = QLabel(f"正在下载新版本 {tag} … 0MB")
+        self._upd_lbl.setStyleSheet("color: #e6e6e6; font-size: 12px;")
         self._upd_bar = QProgressBar()
         self._upd_bar.setRange(0, 100)
         self._upd_bar.setValue(0)
         self._upd_bar.setFormat("%p%")
         lay.addWidget(self._upd_lbl)
         lay.addWidget(self._upd_bar)
+        self._upd_dlg.setStyleSheet(
+            "QDialog { background-color: #262833; border: 1px solid #3a3d4d; border-radius: 8px; }")
+        try:
+            screen = QGuiApplication.primaryScreen().availableGeometry()
+            self._upd_dlg.move(screen.x() + screen.width() - 340,
+                               screen.y() + screen.height() - 130)
+        except Exception:
+            pass
         self._upd_dlg.show()
         threading.Thread(target=self._download_update_worker, args=(tag,), daemon=True).start()
 
     def _download_update_worker(self, tag):
+        self._upd_log("下载线程启动")
         try:
             url = f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/yuketang-gui.exe"
             upd_dir = os.path.join(BASE_DIR, "update")
@@ -285,6 +311,7 @@ class Console(QMainWindow):
                     req = urllib.request.Request(url, headers={"User-Agent": "yuketang-auto-update"})
                     with opener.open(req, timeout=30) as r:
                         total = int(r.headers.get("Content-Length", 0) or 0)
+                        self._upd_log(f"连接成功，总大小 {total} 字节，走代理={bool(proxy)}")
                         done = 0
                         with open(dest, "wb") as f:
                             while True:
@@ -297,30 +324,35 @@ class Console(QMainWindow):
                                     pct = int(done * 100 / total)
                                     if pct != last_pct:
                                         last_pct = pct
-                                        QTimer.singleShot(0, lambda p=pct, d=done, t=total:
-                                                          self._upd_progress(p, d, t))
+                                        self.upd_progress.emit(pct, done, total)
                                 elif done - last_chunk >= 512 * 1024:
                                     last_chunk = done
-                                    QTimer.singleShot(0, lambda d=done: self._upd_progress(-1, d, 0))
-                    QTimer.singleShot(0, lambda: self._finish_update(dest))
+                                    self.upd_progress.emit(-1, done, 0)
+                    self._upd_log(f"下载完成 {done} 字节")
+                    self.upd_finished.emit(dest)
                     return
-                except Exception:
+                except Exception as e:
+                    self._upd_log(f"尝试失败({proxy}): {str(e)[:120]}")
                     try:
                         os.remove(dest)
                     except Exception:
                         pass
                     continue
-            QTimer.singleShot(0, lambda: self._upd_failed("网络不可用或下载失败"))
+            self.upd_error.emit("网络不可用或下载失败")
         except Exception as e:
-            QTimer.singleShot(0, lambda: self._upd_failed(str(e)[:120]))
+            self._upd_log(f"下载异常: {str(e)[:120]}")
+            self.upd_error.emit(str(e)[:120])
 
     def _upd_progress(self, pct, done, total):
+        if getattr(self, "_upd_dlg", None) is None:
+            return
         if pct >= 0:
             self._upd_bar.setValue(pct)
         self._upd_lbl.setText(
             f"正在下载新版本 {self._upd_tag} … {done // 1048576}MB / {total // 1048576}MB")
 
     def _finish_update(self, new_exe):
+        self._upd_log(f"进入安装阶段: {new_exe}")
         try:
             bat = os.path.join(BASE_DIR, "update.bat")
             content = (
@@ -345,12 +377,15 @@ class Console(QMainWindow):
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             self.append_log_note("更新包已就绪，程序将自动重启完成安装。")
-            self._upd_dlg.close()
+            if getattr(self, "_upd_dlg", None) is not None:
+                self._upd_dlg.close()
             QApplication.instance().quit()
         except Exception as e:
+            self._upd_log(f"安装更新失败: {str(e)[:120]}")
             self.append_log_note(f"安装更新失败: {e}")
 
     def _upd_failed(self, err=""):
+        self._upd_log(f"更新失败: {err}")
         if getattr(self, "_upd_dlg", None) is not None:
             self._upd_dlg.close()
         msg = QMessageBox()
