@@ -379,6 +379,9 @@ def ppt_mode(page, dwell, name):
             handle_quiz(page)
         waited = 0
         while waited < dwell:
+            if wait_if_paused(page, name):
+                waited = 0
+                continue
             page.wait_for_timeout(2000)
             waited += 2
             if check_quiz(page):
@@ -410,6 +413,42 @@ def force_mute(page):
         pass
 
 
+PAUSE_FILE = os.path.join(BASE_DIR, "pause.flag")
+
+
+def wait_if_paused(page, name=""):
+    """GUI 点「暂停」后写 pause.flag：检测到则暂停视频/停住翻页，等「继续」后恢复"""
+    if not os.path.exists(PAUSE_FILE):
+        return False
+    log(f"[{name}] ⏸ 收到暂停指令，已暂停（等待继续…）")
+    paused_video = False
+    try:
+        if page.locator("video").count() > 0:
+            page.evaluate(
+                """() => {
+                    const v = document.querySelector('video');
+                    if (v && !v.paused) { v.pause(); }
+                }"""
+            )
+            paused_video = True
+    except Exception:
+        pass
+    while os.path.exists(PAUSE_FILE):
+        page.wait_for_timeout(500)
+    log(f"[{name}] ▶ 收到继续指令，恢复")
+    if paused_video:
+        try:
+            page.evaluate(
+                """() => {
+                    const v = document.querySelector('video');
+                    if (v) { v.muted = true; v.volume = 0; const p = v.play(); if (p) p.catch(()=>{}); }
+                }"""
+            )
+        except Exception:
+            pass
+    return True
+
+
 def video_mode(page, name, quick=False):
     """视频播放模式：实时获取播放状态为主判定，加超时兜底（防异常卡死）
     quick=True 时：检测到视频可播放即返回（不完整播放，用于快速遍历验收）"""
@@ -436,6 +475,9 @@ def video_mode(page, name, quick=False):
         # 快速模式：等 video 出现且能播放，确认后立即切换下一条
         deadline = time.time() + 30
         while time.time() < deadline:
+            if wait_if_paused(page, name):
+                deadline = time.time() + 30
+                continue
             st = vid_state()
             if st is not None:
                 log(f"[{name}] 检测到视频（{st['t']}/{st['d']}）")
@@ -463,6 +505,10 @@ def video_mode(page, name, quick=False):
     last_t = -1
     while True:
         page.wait_for_timeout(10000)
+        # 每轮轮询先检查 GUI 暂停指令
+        if wait_if_paused(page, name):
+            start_time = time.time()
+            continue
         # 每次轮询强制静音，防播放器把静音状态重置回去
         force_mute(page)
         elapsed = time.time() - start_time
@@ -938,6 +984,9 @@ def main(argv=None):
     ap.add_argument("--parallel", type=int, default=1, choices=[1, 2, 3],
                     help="同时刷课的课程数（最多 3，默认 1）")
     ap.add_argument("--status", action="store_true", help="只查看进度记录，不刷课")
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = [a for a in argv if a != "--auto-cli"]  # 单文件模式：剔除自身 CLI 标记
     args = ap.parse_args(argv)
 
     log("=== 雨课堂自动刷课脚本 v7 启动 ===")
@@ -1023,6 +1072,7 @@ def main(argv=None):
         jobs.append(mp_ctx.Process(
             target=run_parallel_worker,
             args=(profile_dir, args.dwell, args.max_lessons, args.quick, args.headless, q),
+            daemon=True,  # 主进程退出时子进程自动终止，防止结束/停止后残留孤儿进程
         ))
     for j in jobs:
         j.start()

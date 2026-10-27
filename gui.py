@@ -16,13 +16,14 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 import webbrowser
 
 import auto  # 内嵌核心刷课逻辑（打包后随本程序一起分发）
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
@@ -30,13 +31,15 @@ from PySide6.QtWidgets import (
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.5"        # 每次发新版前手动递增
+APP_VERSION = "1.0.6"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTO_PY = os.path.join(BASE_DIR, "auto.py")
 PROGRESS_FILE = os.path.join(BASE_DIR, "progress.json")
+PAUSE_FILE = os.path.join(BASE_DIR, "pause.flag")
+IGNORE_FILE = os.path.join(BASE_DIR, "ignored_update.txt")
 LOG_FILE = os.path.join(BASE_DIR, "log.txt")
 
 # 打包（PyInstaller）后：单文件双模式 —— 双击=GUI；GUI 内部用 subprocess 调自身
@@ -87,6 +90,8 @@ QPushButton#startBtn { background-color: #2ea043; color: white; }
 QPushButton#startBtn:hover { background-color: #34b44c; }
 QPushButton#stopBtn { background-color: #c0392b; color: white; }
 QPushButton#stopBtn:hover { background-color: #d44535; }
+QPushButton#pauseBtn { background-color: #d29922; color: white; }
+QPushButton#pauseBtn:hover { background-color: #e0a632; }
 QPushButton#primaryBtn { background-color: #5b6ee1; color: white; }
 QPushButton#primaryBtn:hover { background-color: #6c7fe8; }
 QComboBox {
@@ -113,7 +118,7 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 class Console(QMainWindow):
     # 跨线程信号：后台检查线程发现新版本 → 主线程弹窗；下载线程 → 主线程更新进度/收尾
     update_found = Signal(str, str)
-    upd_progress = Signal(int, int, int)   # pct, done, total
+    upd_progress = Signal(int, int, int, float)   # pct, done, total, speed(MB/s)
     upd_finished = Signal(str)             # 下载完成，new_exe 路径
     upd_error = Signal(str)                # 下载失败原因
 
@@ -126,7 +131,7 @@ class Console(QMainWindow):
         self.proc = None
         self.running_mode = ""
         self.last_log_size = 0
-        self.update_found.connect(self._show_update_dialog)
+        self.update_found.connect(self._on_update_found)
         self.upd_progress.connect(self._upd_progress)
         self.upd_finished.connect(self._finish_update)
         self.upd_error.connect(self._upd_failed)
@@ -196,10 +201,17 @@ class Console(QMainWindow):
         self.btn_start.clicked.connect(self.start)
         ctrl.addWidget(self.btn_start)
 
-        self.btn_stop = QPushButton("停止")
-        self.btn_stop.setObjectName("stopBtn")
-        self.btn_stop.clicked.connect(self.stop)
-        ctrl.addWidget(self.btn_stop)
+        self.btn_pause = QPushButton("暂停")
+        self.btn_pause.setObjectName("pauseBtn")
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.clicked.connect(self.toggle_pause)
+        ctrl.addWidget(self.btn_pause)
+
+        self.btn_end = QPushButton("结束")
+        self.btn_end.setObjectName("stopBtn")
+        self.btn_end.setEnabled(False)
+        self.btn_end.clicked.connect(self.end_now)
+        ctrl.addWidget(self.btn_end)
 
         self.btn_status = QPushButton("检查状态")
         self.btn_status.setObjectName("primaryBtn")
@@ -237,20 +249,45 @@ class Console(QMainWindow):
                 pass
         threading.Thread(target=worker, daemon=True).start()
 
+    def _on_update_found(self, tag, url):
+        """发现新版：若该版本已被「忽略」则不弹（直到下个版本发布）；否则弹窗三选"""
+        if self._is_ignored(tag):
+            return
+        self._show_update_dialog(tag, url)
+
+    def _is_ignored(self, tag):
+        try:
+            with open(IGNORE_FILE, "r", encoding="utf-8") as f:
+                ignored = f.read().strip()
+            return _ver_tuple(ignored) >= _ver_tuple(tag)
+        except Exception:
+            return False
+
     def _show_update_dialog(self, tag, url):
         msg = QMessageBox()
         msg.setWindowTitle("发现新版本")
         msg.setIcon(QMessageBox.Icon.Information)
         msg.setText(
-            f"雨课堂刷课工具有新版本 **{tag}**\n\n"
-            f"当前版本：v{APP_VERSION}\n\n"
-            f"点击「下载更新」会自动下载并重启为新版，全程无需手动操作。"
+            f"雨课堂刷课工具有新版本 **v{tag}**\n\n"
+            f"当前版本：v{APP_VERSION}"
         )
-        ok_btn = msg.addButton("下载更新", QMessageBox.ButtonRole.AcceptRole)
-        msg.addButton("忽略", QMessageBox.ButtonRole.RejectRole)
+        dl_btn = msg.addButton("下载更新", QMessageBox.ButtonRole.AcceptRole)
+        later_btn = msg.addButton("下次提醒", QMessageBox.ButtonRole.RejectRole)
+        ignore_btn = msg.addButton("忽略此版本", QMessageBox.ButtonRole.DestructiveRole)
         msg.exec()
-        if msg.clickedButton() == ok_btn:
+        clicked = msg.clickedButton()
+        if clicked == dl_btn:
+            self.append_log_note(f"选择下载更新 v{tag}，开始自动下载…")
             self._start_update(tag)
+        elif clicked == ignore_btn:
+            try:
+                with open(IGNORE_FILE, "w", encoding="utf-8") as f:
+                    f.write(tag)
+            except Exception:
+                pass
+            self.append_log_note(f"已忽略 v{tag}，下个版本发布后再提醒。")
+        else:
+            self.append_log_note(f"选择下次提醒 v{tag}。")
 
     # ---------- 自动更新 ----------
     def _upd_log(self, text):
@@ -262,39 +299,11 @@ class Console(QMainWindow):
 
     def _start_update(self, tag):
         if self.proc is not None and self.proc.poll() is None:
-            self.append_log_note("有刷课任务在运行，请先点“停止”后再更新。")
+            self.append_log_note("有刷课任务在运行，跳过自动更新（刷课结束重启程序即可更新）。")
             return
         self._upd_log(f"开始更新 {tag}")
         self._upd_tag = tag
-        # 右下角无边框小窗（置顶、不抢焦点）：正在下载 + 进度条
-        try:
-            self._upd_dlg = QDialog(self)
-            self._upd_dlg.setWindowFlags(
-                Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-            self._upd_dlg.setFixedSize(320, 92)
-            lay = QVBoxLayout(self._upd_dlg)
-            lay.setContentsMargins(14, 10, 14, 10)
-            self._upd_lbl = QLabel(f"正在下载新版本 {tag} … 0MB")
-            self._upd_lbl.setStyleSheet("color: #e6e6e6; font-size: 12px;")
-            self._upd_bar = QProgressBar()
-            self._upd_bar.setRange(0, 100)
-            self._upd_bar.setValue(0)
-            self._upd_bar.setFormat("%p%")
-            lay.addWidget(self._upd_lbl)
-            lay.addWidget(self._upd_bar)
-            self._upd_dlg.setStyleSheet(
-                "QDialog { background-color: #262833; border: 1px solid #3a3d4d; border-radius: 8px; }")
-            try:
-                g = self.frameGeometry()
-                self._upd_dlg.move(g.x() + g.width() - 340,
-                                   g.y() + g.height() - 130)
-            except Exception:
-                pass
-            self._upd_dlg.show()
-            self._upd_log("小窗已显示")
-        except Exception as e:
-            self._upd_log(f"小窗创建失败(继续下载): {str(e)[:200]}")
-            self._upd_dlg = None
+        self._upd_dlg = None
         threading.Thread(target=self._download_update_worker, args=(tag,), daemon=True).start()
 
     def _download_update_worker(self, tag):
@@ -318,6 +327,8 @@ class Console(QMainWindow):
                         total = int(r.headers.get("Content-Length", 0) or 0)
                         self._upd_log(f"连接成功，总大小 {total} 字节，走代理={bool(proxy)}")
                         done = 0
+                        last_time = time.time()
+                        last_done = 0
                         with open(dest, "wb") as f:
                             while True:
                                 chunk = r.read(1 << 16)
@@ -325,14 +336,13 @@ class Console(QMainWindow):
                                     break
                                 f.write(chunk)
                                 done += len(chunk)
-                                if total:
-                                    pct = int(done * 100 / total)
-                                    if pct != last_pct:
-                                        last_pct = pct
-                                        self.upd_progress.emit(pct, done, total)
-                                elif done - last_chunk >= 512 * 1024:
-                                    last_chunk = done
-                                    self.upd_progress.emit(-1, done, 0)
+                                now = time.time()
+                                if (total and now - last_time >= 1.0) or done >= total:
+                                    pct = int(done * 100 / total) if total else -1
+                                    speed = (done - last_done) / max(now - last_time, 0.001) / 1048576
+                                    self.upd_progress.emit(pct, done, total, speed)
+                                    last_time = now
+                                    last_done = done
                     self._upd_log(f"下载完成 {done} 字节")
                     self.upd_finished.emit(dest)
                     return
@@ -348,13 +358,20 @@ class Console(QMainWindow):
             self._upd_log(f"下载异常: {str(e)[:120]}")
             self.upd_error.emit(str(e)[:120])
 
-    def _upd_progress(self, pct, done, total):
-        if getattr(self, "_upd_dlg", None) is None:
-            return
+    def _upd_progress(self, pct, done, total, speed):
+        """cmd 风格进度：原地刷新日志最后一行，不刷屏"""
         if pct >= 0:
-            self._upd_bar.setValue(pct)
-        self._upd_lbl.setText(
-            f"正在下载新版本 {self._upd_tag} … {done // 1048576}MB / {total // 1048576}MB")
+            text = (f"下载更新：{pct:3d}% | {done // 1048576}MB / {total // 1048576}MB"
+                    f" | {speed:.1f} MB/s")
+        else:
+            text = f"下载更新：{done // 1048576}MB | {speed:.1f} MB/s"
+        try:
+            block = self.log_view.document().lastBlock()
+            cursor = QTextCursor(block)
+            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            cursor.insertText(text)
+        except Exception:
+            self.append_log_note(text)
 
     def _finish_update(self, new_exe):
         self._upd_log(f"进入安装阶段: {new_exe}")
@@ -384,9 +401,7 @@ class Console(QMainWindow):
                     | getattr(subprocess, "DETACHED_PROCESS", 0)
                 ),
             )
-            self.append_log_note("更新包已就绪，程序将自动重启完成安装。")
-            if getattr(self, "_upd_dlg", None) is not None:
-                self._upd_dlg.close()
+            self.append_log_note("下载完成，程序将自动重启完成安装…")
             QApplication.instance().quit()
         except Exception as e:
             self._upd_log(f"安装更新失败: {str(e)[:120]}")
@@ -394,14 +409,8 @@ class Console(QMainWindow):
 
     def _upd_failed(self, err=""):
         self._upd_log(f"更新失败: {err}")
-        if getattr(self, "_upd_dlg", None) is not None:
-            self._upd_dlg.close()
-        msg = QMessageBox()
-        msg.setWindowTitle("更新失败")
-        msg.setText(f"下载更新失败：{err}\n\n可前往 GitHub Releases 手动下载。")
-        msg.addButton("前往下载", QMessageBox.ButtonRole.AcceptRole)
-        msg.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
-        msg.exec()
+        self.append_log_note(
+            f"自动更新失败：{err}（可前往 GitHub Releases 手动下载）")
 
     def _mk_label(self, text):
         lbl = QLabel(text)
@@ -501,6 +510,9 @@ class Console(QMainWindow):
             self.proc = None
             self.status_lbl.setText("空闲（上次运行已结束）")
             self.status_lbl.setStyleSheet("color: #2ea043; font-size: 14px; font-weight: bold;")
+            self.btn_pause.setText("暂停")
+            self.btn_pause.setEnabled(False)
+            self.btn_end.setEnabled(False)
         elif self.proc is not None:
             mode_txt = "检查中…" if getattr(self, "running_mode", "") == "检查" else "刷课中…"
             mode_color = "#5b6ee1" if getattr(self, "running_mode", "") == "检查" else "#d29922"
@@ -524,6 +536,10 @@ class Console(QMainWindow):
             self.append_log_note(f"启动失败: {e}")
             return False
         self.append_log_note(f"已启动：{' '.join(extra_args)}（{mode_label}）")
+        self._clear_pause()
+        self.btn_pause.setText("暂停")
+        self.btn_pause.setEnabled(True)
+        self.btn_end.setEnabled(True)
         return True
 
     def start(self):
@@ -561,26 +577,109 @@ class Console(QMainWindow):
         self.status_lbl.setText("检查中…")
         self.status_lbl.setStyleSheet("color: #5b6ee1; font-size: 14px; font-weight: bold;")
 
+    def toggle_pause(self):
+        """暂停/继续：写或删 pause.flag，刷课进程检测后暂停/恢复播放"""
+        if os.path.exists(PAUSE_FILE):
+            try:
+                os.remove(PAUSE_FILE)
+            except Exception:
+                pass
+            self.btn_pause.setText("暂停")
+            self.append_log_note("已发送「继续」指令，刷课恢复。")
+        else:
+            try:
+                with open(PAUSE_FILE, "w", encoding="utf-8") as f:
+                    f.write("1")
+            except Exception as e:
+                self.append_log_note(f"发送暂停指令失败: {e}")
+                return
+            self.btn_pause.setText("继续")
+            self.append_log_note("已发送「暂停」指令，当前条目暂停播放，进度不计入。")
+
+    def end_now(self):
+        """结束：彻底关闭刷课脚本 + 所有刷课用的 Edge 浏览器 + 残留进程"""
+        self._clear_pause()
+        self.stop()
+        self.btn_pause.setText("暂停")
+        self.btn_pause.setEnabled(False)
+        self.btn_end.setEnabled(False)
+        self.append_log_note("已结束：刷课脚本与浏览器均已关闭。")
+
+    def _clear_pause(self):
+        try:
+            if os.path.exists(PAUSE_FILE):
+                os.remove(PAUSE_FILE)
+        except Exception:
+            pass
+
+    def _run_cleanup(self):
+        """进程树清理（psutil 原生，不依赖 PowerShell）：
+        1) auto-cli / multiprocessing-fork 的刷课脚本进程
+        2) 刷课 Edge（命令行含 edge_profile）
+        3) python + yuketang 残留"""
+        try:
+            import psutil
+        except Exception:
+            self._run_cleanup_ps()
+            return
+        killed = []
+        try:
+            for proc in psutil.process_iter(["name", "cmdline"]):
+                try:
+                    name = (proc.info["name"] or "").lower()
+                    cmd = " ".join(proc.info["cmdline"] or [])
+                except Exception:
+                    continue
+                hit = False
+                if "yuketang" in name and ("--auto-cli" in cmd or "--multiprocessing-fork" in cmd):
+                    hit = True
+                elif name == "msedge.exe" and "edge_profile" in cmd:
+                    hit = True
+                elif name.startswith("python") and "yuketang" in cmd:
+                    hit = True
+                if hit:
+                    try:
+                        proc.kill()
+                        killed.append(proc.pid)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self.append_log_note(f"已清理残留进程：{len(killed)} 个")
+
+    def _run_cleanup_ps(self):
+        """psutil 不可用时的 PowerShell 兜底清理"""
+        ps = r'''
+$cli = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'yuketang' -and ($_.CommandLine -match '--auto-cli' -or $_.CommandLine -match '--multiprocessing-fork') })
+foreach ($p in $cli) { & taskkill /f /t /pid $p.ProcessId 2>$null | Out-Null }
+$ms = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'msedge' -and $_.CommandLine -match 'edge_profile' })
+foreach ($p in $ms) { & taskkill /f /t /pid $p.ProcessId 2>$null | Out-Null }
+'''
+        ps_file = os.path.join(BASE_DIR, "_cleanup.ps1")
+        try:
+            with open(ps_file, "w", encoding="utf-8-sig") as f:
+                f.write(ps)
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_file],
+                timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            pass
+        finally:
+            try:
+                os.remove(ps_file)
+            except Exception:
+                pass
+
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:
             try:
                 self.proc.terminate()
             except Exception:
                 pass
-            self.proc = None
-        ps = r"""
-$ps = Get-CimInstance Win32_Process | Where-Object {
-    ($_.Name -match 'yuketang' -and $_.CommandLine -match 'auto-cli') -or
-    ($_.Name -match 'msedge' -and $_.CommandLine -match 'edge_profile') -or
-    ($_.Name -match 'python' -and $_.CommandLine -match 'yuketang')
-}
-foreach ($p in $ps) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-"""
-        try:
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=30,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        except Exception:
-            pass
+        self.proc = None
+        self._run_cleanup()
         self.status_lbl.setText("已停止")
         self.status_lbl.setStyleSheet("color: #2ea043; font-size: 14px; font-weight: bold;")
         self.append_log_note("已手动停止，并清理了残留进程。")
@@ -638,6 +737,15 @@ if __name__ == "__main__":
     # 单文件双模式：GUI 用 subprocess 调自身带 --auto-cli 参数时，直接跑刷课逻辑、不打开窗口
     if FROZEN and CLI_FLAG in sys.argv:
         args = [a for a in sys.argv[1:] if a != CLI_FLAG]
-        auto.main(args or None)
+        try:
+            auto.main(args)
+        except Exception:
+            import traceback
+            try:
+                with open(os.path.join(BASE_DIR, "auto_err.txt"), "w", encoding="utf-8") as f:
+                    f.write(traceback.format_exc())
+            except Exception:
+                pass
+            sys.exit(1)
         sys.exit(0)
     main()
