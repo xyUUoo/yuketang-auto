@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.10"        # 每次发新版前手动递增
+APP_VERSION = "1.0.11"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -186,6 +186,8 @@ class Console(QMainWindow):
         hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(3, 180)
         hh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        # 最后一列（类型分布）吸收剩余宽度，表格整体填满横向空间；其余列按内容自适应
+        hh.setStretchLastSection(True)
         split.addWidget(self.table)
 
         self.log_view = QPlainTextEdit()
@@ -393,7 +395,7 @@ class Console(QMainWindow):
             self.upd_error.emit(str(e)[:120])
 
     def _upd_progress(self, pct, done, total, speed):
-        """cmd 风格进度：原地刷新日志最后一行，不刷屏"""
+        """cmd 风格进度：原地刷新"下载更新"进度行，不刷屏；若最后一行不是进度行则先新起一行，避免顶掉其他日志"""
         if pct >= 0:
             text = (f"下载更新：{pct:3d}% | {done // 1048576}MB / {total // 1048576}MB"
                     f" | {speed:.1f} MB/s")
@@ -401,9 +403,12 @@ class Console(QMainWindow):
             text = f"下载更新：{done // 1048576}MB | {speed:.1f} MB/s"
         try:
             block = self.log_view.document().lastBlock()
-            cursor = QTextCursor(block)
-            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
-            cursor.insertText(text)
+            if block.text().startswith("下载更新"):
+                cursor = QTextCursor(block)
+                cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+                cursor.insertText(text)
+            else:
+                self.append_log_note(text)
         except Exception:
             self.append_log_note(text)
 
@@ -419,14 +424,14 @@ class Console(QMainWindow):
                 "%S%\\taskkill /f /im yuketang-gui.exe >nul 2>&1\r\n"
                 "set /a cnt=0\r\n"
                 ":wait\r\n"
-                "%S%\\tasklist /fi \"imagename eq yuketang-gui.exe\" 2>nul | %S%\\findstr /r /c:\"^yuketang-gui\" >nul\r\n"
-                "if errorlevel 1 goto :dodel\r\n"
-                "set /a cnt+=1\r\n"
-                "if %cnt% geq 15 goto :dodel\r\n"
-                "%S%\\timeout /t 1 /nobreak >nul\r\n"
-                "goto :wait\r\n"
+                "%S%\\ping -n 2 127.0.0.1 >nul 2>&1\r\n"
+                "del /f /q \"%APP%\" >nul 2>&1\r\n"
+                "if exist \"%APP%\" (\r\n"
+                "    set /a cnt+=1\r\n"
+                "    if %cnt% geq 15 goto :dodel\r\n"
+                "    goto :wait\r\n"
+                ")\r\n"
                 ":dodel\r\n"
-                'del /f /q "%APP%" >nul 2>&1\r\n'
                 'move /y "%NEW%" "%APP%" >nul 2>&1\r\n'
                 'start "" "%APP%"\r\n'
                 'rd /s /q "%~dp0update" >nul 2>&1\r\n'

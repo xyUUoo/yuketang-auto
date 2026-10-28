@@ -91,8 +91,12 @@ def save_progress_merge(updates):
             break
         except FileExistsError:
             time.sleep(0.2)
-    prog = load_progress()
+    if fd is None:
+        # 拿不到锁就放弃本次写入：避免无锁裸写导致两个窗口互相覆盖、进度丢失
+        log("进度写盘：锁占用超时（10 秒），放弃本次写入（避免覆盖其他窗口的进度）。")
+        return
     try:
+        prog = load_progress()
         prog["courses"].update(updates)
         prog["updated"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
@@ -140,6 +144,8 @@ def is_logged_in(page):
         return False
     if "我的课程" in text or "继续学习" in text:
         return True
+    if not text.strip():
+        return None  # 页面还没渲染出来（Edge 打开慢/白屏）：不判定，继续等待
     return True
 
 
@@ -147,13 +153,17 @@ def wait_login(page, timeout_min=5):
     log("检查登录状态……")
     start = time.time()
     while True:
-        if is_logged_in(page):
+        r = is_logged_in(page)
+        if r is True:
             log("已登录，继续。")
             return True
         if time.time() - start > timeout_min * 60:
             log("等待登录超时，请重新运行脚本并尽快登录。")
             return False
-        log("浏览器已打开登录页，请在浏览器中扫码/输入账号登录（等待中……）")
+        if r is False:
+            log("浏览器已打开登录页，请在浏览器中扫码/输入账号登录（等待中……）")
+        else:
+            log("页面加载中，继续等待……")
         page.wait_for_timeout(4000)
 
 
@@ -210,7 +220,8 @@ def find_course_entries(page):
                     if (!/(lesson-card|box-card)/i.test(cls)) continue;
                     const txt = (el.innerText || '').trim().replace(/\\s+/g, ' ');
                     if (!txt || txt.length < 5) continue;
-                    if (!/(秋|春)/.test(txt) || !/班/.test(txt)) continue;
+                    // 只按学期识别（秋/春），不要求含"班"——避免不含"班"的课程卡片整门被丢
+                    if (!/(秋|春)/.test(txt)) continue;
                     const key = txt.slice(0, 30);
                     if (seen.has(key)) continue;
                     seen.add(key);
@@ -268,7 +279,7 @@ def parse_todo_items(page):
                     const type = lines[0];
                     const scored = lines.some(l => l.includes('计分'));
                     const status = lines.find(l => /未开始|进行中|已完成|未完成/.test(l)) || '未开始';
-                    const name = lines.find(l => /项目|课/.test(l) && l.length > 2) || (lines[2] || '');
+                    const name = lines.find(l => /项目|课/.test(l) && l.length > 2) || (lines[1] || lines.join(' '));
                     out.push({type: type, scored: scored, status: status, name: name});
                 });
                 return out;
@@ -426,8 +437,7 @@ def wait_if_paused(page, name=""):
         if page.locator("video").count() > 0:
             page.evaluate(
                 """() => {
-                    const v = document.querySelector('video');
-                    if (v && !v.paused) { v.pause(); }
+                    document.querySelectorAll('video').forEach(v => { if (!v.paused) { v.pause(); } });
                 }"""
             )
             paused_video = True
@@ -440,8 +450,9 @@ def wait_if_paused(page, name=""):
         try:
             page.evaluate(
                 """() => {
-                    const v = document.querySelector('video');
-                    if (v) { v.muted = true; v.volume = 0; const p = v.play(); if (p) p.catch(()=>{}); }
+                    document.querySelectorAll('video').forEach(v => {
+                        v.muted = true; v.volume = 0; const p = v.play(); if (p) p.catch(()=>{});
+                    });
                 }"""
             )
         except Exception:
@@ -576,17 +587,30 @@ def study_one(page, context, item, dwell, unfinished_url, quick=False):
             pass
         page.wait_for_timeout(4000)
 
-    # 学习页判断：有 video 则视频模式，否则按课件翻页
+    # 学习页判断：有 video 则视频模式，否则按课件翻页。
+    # 视频是懒加载的（进入页面几秒后才挂 <video>），轮询最多 12 秒，避免误判成课件
     has_video = False
-    try:
-        has_video = page.locator("video").count() > 0
-    except Exception:
-        pass
+    for _ in range(8):
+        try:
+            if page.locator("video").count() > 0:
+                has_video = True
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
 
     if has_video:
         ok = video_mode(page, name, quick=quick)
     else:
         ok = ppt_mode(page, dwell, name)
+        # 课件模式失败（如 .page 元素不存在）：回头再确认一次是否有 video（懒加载更慢的情况）
+        if not ok:
+            try:
+                if page.locator("video").count() > 0:
+                    log(f"[{name}] 课件模式失败但检测到视频，改走视频播放模式")
+                    ok = video_mode(page, name, quick=quick)
+            except Exception:
+                pass
 
     # 返回未完成列表页（SPA 同页跳转，直接 goto 带 tab=unfinished 的 URL 最稳）
     try:
@@ -663,8 +687,8 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
         if state == "fail":
             log(f"[{course_name}] 多次重试（5 次）后待办仍为空，按无任务处理（之后刷课跳过，下次检查重新评估）。")
             return 0, 0, 0, type_cnt
-        log(f"[{course_name}] 待办已加载但没有目标视频，视为已刷完。")
-        return 0, len(all_items), 0, type_cnt
+        log(f"[{course_name}] 待办已加载但没有目标视频，视为已刷完（无视频任务，刷课跳过，下次检查重新评估）。")
+        return 0, 0, 0, type_cnt  # remaining 归零：与 target=0 保持自洽（GUI 显示"无任务"，不显示残留剩余数）
 
     done = 0
     total = len(targets)
@@ -734,7 +758,7 @@ def notify_done(prog, total_done, course_count):
     """刷课结束弹窗（PySide6 深色风格，与控制台一致），显示在屏幕顶部居中，并发送 Windows 通知"""
     log("========== 刷课结束 ==========")
     try:
-        from PySide6.QtCore import Qt
+        from PySide6.QtCore import Qt, QTimer
         from PySide6.QtGui import QColor, QFont, QGuiApplication
         from PySide6.QtWidgets import (
             QApplication, QDialog, QHBoxLayout, QHeaderView, QLabel,
@@ -828,6 +852,9 @@ QPushButton:pressed { background-color: #4a5bc0; }
         dlg.show()
         # 同步发一条 Windows 系统通知（右下角 toast）
         win_toast("雨课堂刷课完成", f"共处理 {course_count} 门课程，刷完 {total_done} 个视频条目。")
+        # 60 秒无操作自动关闭：防止弹窗没人点「确认」时进程一直挂着，
+        # GUI 靠 proc.poll() 判断结束会一直显示"刷课中"
+        QTimer.singleShot(60000, dlg.accept)
         app.exec()
     except Exception as e:
         # 极端环境下 PySide6 不可用则退回纯文字记录
@@ -965,6 +992,10 @@ def claim_next_task(worker_tag):
             break
         except FileExistsError:
             time.sleep(0.2)
+    if fd is None:
+        # 拿不到锁放弃本次领取：避免无锁裸写导致同一课程被两个窗口重复领
+        log("任务领取：锁占用超时（10 秒），本窗口本次放弃领取。")
+        return None
     try:
         try:
             with open(TASKS_FILE, "r", encoding="utf-8") as f:
@@ -978,8 +1009,9 @@ def claim_next_task(worker_tag):
                 try:
                     with open(TASKS_FILE, "w", encoding="utf-8") as f:
                         json.dump(data, f, ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"任务领取：写 tasks.json 失败（{e}），放弃该任务，避免重复领取。")
+                    return None
                 return task
         return None
     finally:
@@ -1009,6 +1041,18 @@ def ensure_parallel_profiles(parallel):
             log(f"【profile】复制失败: {str(e)[:150]}")
 
 
+def cleanup_stale_locks():
+    """启动时清理残留的 .lock 文件（GUI「结束」强杀 worker 的瞬间可能残留，
+    不清理会导致之后所有写盘都拿不到锁、降级为放弃写入）"""
+    for p in (PROGRESS_FILE + ".lock", TASKS_FILE + ".lock"):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+                log(f"已清理残留锁文件: {os.path.basename(p)}")
+        except Exception:
+            pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="雨课堂自动刷课（跨课程，视频+计分+未完成）")
     ap.add_argument("--course", default=None, help="课程名（模糊匹配），只刷该课程；不填则刷所有课程")
@@ -1026,6 +1070,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     log("=== 雨课堂自动刷课脚本 v7 启动 ===")
+    cleanup_stale_locks()
 
     prog = load_progress()
     if args.status:
