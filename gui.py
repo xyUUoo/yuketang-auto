@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.12"        # 每次发新版前手动递增
+APP_VERSION = "1.0.13"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -857,24 +857,49 @@ def proxy_list():
     return [None, DEFAULT_PROXY]
 
 
-def fetch_latest_release():
-    """后台查询 GitHub 最新 Release；成功返回 (tag, release_url)，失败/无网返回 None"""
+def _make_opener(proxy):
+    if proxy:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    return urllib.request.build_opener()
+
+
+def _fetch_via_html(proxy):
+    """通道 1：HTML 302 跳转（github.com/.../releases/latest → /releases/tag/vX.Y.Z）。
+    不走 API，没有匿名限流。"""
+    url = f"https://github.com/{GITHUB_REPO}/releases/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": "yuketang-auto-check"})
+    with _make_opener(proxy).open(req, timeout=6) as r:
+        final = r.geturl()
+        tag = final.rstrip("/").rsplit("/", 1)[-1]
+        if tag and tag.lower().startswith("v"):
+            return tag, final
+    return None
+
+
+def _fetch_via_api(proxy):
+    """通道 2：GitHub API（未限流时最权威；匿名限流 60 次/小时可能 403，作为兜底）"""
     api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    for proxy in proxy_list():
-        try:
-            if proxy:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-            else:
-                opener = urllib.request.build_opener()
-            req = urllib.request.Request(api, headers={"User-Agent": "yuketang-auto-check"})
-            with opener.open(req, timeout=6) as r:
-                data = json.loads(r.read().decode("utf-8"))
-                tag = data.get("tag_name", "")
-                if tag:
-                    return tag, data.get("html_url", GITHUB_RELEASE_URL)
-        except Exception:
-            continue
+    req = urllib.request.Request(api, headers={"User-Agent": "yuketang-auto-check"})
+    with _make_opener(proxy).open(req, timeout=6) as r:
+        data = json.loads(r.read().decode("utf-8"))
+        tag = data.get("tag_name", "")
+        if tag:
+            return tag, data.get("html_url", GITHUB_RELEASE_URL)
+    return None
+
+
+def fetch_latest_release():
+    """后台查询 GitHub 最新 Release，双通道：API 优先（未限流时最快最权威），HTML 兜底（防限流 403）。
+    每个通道都按 直连 → 配置代理 的顺序尝试。成功返回 (tag, release_url)，全部失败返回 None"""
+    for fetch_fn in (_fetch_via_api, _fetch_via_html):
+        for proxy in proxy_list():
+            try:
+                r = fetch_fn(proxy)
+                if r:
+                    return r
+            except Exception:
+                continue
     return None
 
 
