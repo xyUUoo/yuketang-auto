@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.11"        # 每次发新版前手动递增
+APP_VERSION = "1.0.12"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -52,8 +52,13 @@ if FROZEN:
     PYTHON = None
     PROGRESS_FILE = os.path.join(BASE_DIR, "progress.json")
     LOG_FILE = os.path.join(BASE_DIR, "log.txt")
+    # 当前正在运行的程序本身：用户改过 exe 文件名也跟随（更新安装用这个名字替换/杀进程）
+    APP_EXE = sys.executable
+    APP_NAME = os.path.basename(sys.executable)
 else:
     PYTHON = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
+    APP_EXE = os.path.join(BASE_DIR, "yuketang-gui.exe")
+    APP_NAME = "yuketang-gui.exe"
 
 # CLI 模式标志：打包后 subprocess 调用自身时附加，入口据此直接跑刷课逻辑
 CLI_FLAG = "--auto-cli"
@@ -418,10 +423,10 @@ class Console(QMainWindow):
             bat = os.path.join(BASE_DIR, "update.bat")
             content = (
                 "@echo off\r\n"
-                f'set "APP={os.path.join(BASE_DIR, "yuketang-gui.exe")}"\r\n'
+                f'set "APP={APP_EXE}"\r\n'
                 f'set "NEW={new_exe}"\r\n'
                 "set S=%SystemRoot%\\System32\r\n"
-                "%S%\\taskkill /f /im yuketang-gui.exe >nul 2>&1\r\n"
+                f"%S%\\taskkill /f /im {APP_NAME} >nul 2>&1\r\n"
                 "set /a cnt=0\r\n"
                 ":wait\r\n"
                 "%S%\\ping -n 2 127.0.0.1 >nul 2>&1\r\n"
@@ -796,10 +801,14 @@ class SettingsDialog(QDialog):
         tip = QLabel("留空并保存 = 仅直连 GitHub（不使用代理）")
         tip.setStyleSheet("color: #8a91a8; font-size: 12px;")
         btn_row = QHBoxLayout()
+        check_btn = QPushButton("检查更新")
+        check_btn.setToolTip("立即用当前代理设置检查 GitHub 新版本（保存代理后生效）")
+        check_btn.clicked.connect(self._check_now)
         save_btn = QPushButton("保存")
         save_btn.clicked.connect(self._save)
         cancel_btn = QPushButton("取消")
         cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(check_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(save_btn)
         btn_row.addWidget(cancel_btn)
@@ -807,6 +816,14 @@ class SettingsDialog(QDialog):
         lay.addWidget(self.proxy_edit)
         lay.addWidget(tip)
         lay.addLayout(btn_row)
+
+    def _check_now(self):
+        """手动检查更新：先按输入框里的代理保存，再触发主窗口重新检查"""
+        save_settings({"proxy": self.proxy_edit.text().strip()})
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_start_update_check"):
+            parent._start_update_check()
+        self.accept()
 
     def _save(self):
         save_settings({"proxy": self.proxy_edit.text().strip()})
