@@ -25,13 +25,13 @@ import auto  # 内嵌核心刷课逻辑（打包后随本程序一起分发）
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
+    QApplication, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.8"        # 每次发新版前手动递增
+APP_VERSION = "1.0.9"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -41,6 +41,8 @@ PROGRESS_FILE = os.path.join(BASE_DIR, "progress.json")
 PAUSE_FILE = os.path.join(BASE_DIR, "pause.flag")
 IGNORE_FILE = os.path.join(BASE_DIR, "ignored_update.txt")
 LOG_FILE = os.path.join(BASE_DIR, "log.txt")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+DEFAULT_PROXY = "http://127.0.0.1:12450"
 
 # 打包（PyInstaller）后：单文件双模式 —— 双击=GUI；GUI 内部用 subprocess 调自身
 # （--auto-cli 参数）跑刷课逻辑，与 GUI 完全隔离，互不干扰
@@ -121,6 +123,7 @@ class Console(QMainWindow):
     upd_progress = Signal(int, int, int, float)   # pct, done, total, speed(MB/s)
     upd_finished = Signal(str)             # 下载完成，new_exe 路径
     upd_error = Signal(str)                # 下载失败原因
+    log_note = Signal(str)                 # 后台线程 → 主线程日志
 
     def __init__(self):
         super().__init__()
@@ -135,6 +138,7 @@ class Console(QMainWindow):
         self.upd_progress.connect(self._upd_progress)
         self.upd_finished.connect(self._finish_update)
         self.upd_error.connect(self._upd_failed)
+        self.log_note.connect(self.append_log_note)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -148,6 +152,10 @@ class Console(QMainWindow):
         title.setFont(QFont("Microsoft YaHei UI", 17, QFont.Weight.Bold))
         head.addWidget(title)
         head.addStretch(1)
+        self.settings_btn = QPushButton("设置")
+        self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_btn.clicked.connect(self._open_settings)
+        head.addWidget(self.settings_btn)
         self.updated_lbl = QLabel("更新：—")
         self.updated_lbl.setStyleSheet("color: #9aa0b4; font-size: 12px;")
         head.addWidget(self.updated_lbl)
@@ -238,6 +246,14 @@ class Console(QMainWindow):
         # 启动 3 秒后后台检查 GitHub 是否有新版本（失败静默）
         QTimer.singleShot(3000, self._start_update_check)
 
+    def _open_settings(self):
+        dlg = SettingsDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            proxy = (load_settings().get("proxy") or "").strip()
+            self.append_log_note(
+                f"设置已保存（代理：{proxy or '仅直连'}），重新检查更新…")
+            self._start_update_check()
+
     def _start_update_check(self):
         def worker():
             try:
@@ -245,9 +261,17 @@ class Console(QMainWindow):
                 if result:
                     tag, url = result
                     if _ver_tuple(tag) > _ver_tuple(APP_VERSION):
+                        self.log_note.emit(
+                            f"发现新版本 v{tag}（当前 v{APP_VERSION}）")
                         self.update_found.emit(tag, url)
-            except Exception:
-                pass
+                    else:
+                        self.log_note.emit(f"已是最新版本 v{tag}")
+                else:
+                    self.log_note.emit(
+                        "检查更新失败：无法连接 GitHub（直连与本地代理均不可用）")
+            except Exception as e:
+                self.log_note.emit(f"检查更新异常：{str(e)[:100]}")
+        self.log_note.emit("正在检查更新…")
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_update_found(self, tag, url):
@@ -316,7 +340,7 @@ class Console(QMainWindow):
             dest = os.path.join(upd_dir, "yuketang-gui.exe")
             last_pct = -1
             last_chunk = 0
-            for proxy in (None, "http://127.0.0.1:12450"):
+            for proxy in proxy_list():
                 try:
                     if proxy:
                         opener = urllib.request.build_opener(
@@ -739,10 +763,71 @@ def _ver_tuple(tag):
     return tuple(out)
 
 
+class SettingsDialog(QDialog):
+    """设置窗口：可修改检查更新/下载使用的代理地址"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.setFixedSize(430, 170)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+        lbl = QLabel("检查更新 / 下载使用的代理地址：")
+        lbl.setStyleSheet("color: #e6e6e6; font-size: 13px;")
+        self.proxy_edit = QLineEdit(load_settings().get("proxy") or DEFAULT_PROXY)
+        self.proxy_edit.setPlaceholderText("例如 http://127.0.0.1:12450")
+        tip = QLabel("留空并保存 = 仅直连 GitHub（不使用代理）")
+        tip.setStyleSheet("color: #8a91a8; font-size: 12px;")
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self._save)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch(1)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        lay.addWidget(lbl)
+        lay.addWidget(self.proxy_edit)
+        lay.addWidget(tip)
+        lay.addLayout(btn_row)
+
+    def _save(self):
+        save_settings({"proxy": self.proxy_edit.text().strip()})
+        self.accept()
+
+
+def load_settings():
+    """读取本地设置（settings.json），无文件/异常返回空字典"""
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def proxy_list():
+    """检查更新/下载走代理的顺序：直连 → 设置里配置的代理；
+    没配置过代理时默认用 DEFAULT_PROXY（保持旧行为）。"""
+    cfg = (load_settings().get("proxy") or "").strip()
+    if cfg:
+        return [None, cfg]
+    return [None, DEFAULT_PROXY]
+
+
 def fetch_latest_release():
     """后台查询 GitHub 最新 Release；成功返回 (tag, release_url)，失败/无网返回 None"""
     api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    for proxy in (None, "http://127.0.0.1:12450"):
+    for proxy in proxy_list():
         try:
             if proxy:
                 opener = urllib.request.build_opener(
