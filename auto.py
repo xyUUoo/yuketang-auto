@@ -659,12 +659,12 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
     if not targets:
         if state == "empty":
             log(f"[{course_name}] 暂无未完成待办，视为已刷完。")
-            return 0, 0, 0
+            return 0, 0, 0, type_cnt
         if state == "fail":
-            log(f"[{course_name}] 多次重试后待办仍为空，跳过该课程（下次重跑会自动再试）。")
-            return 0, None, None  # None = 加载失败/未知，不更新进度记录
+            log(f"[{course_name}] 多次重试（5 次）后待办仍为空，按无任务处理（之后刷课跳过，下次检查重新评估）。")
+            return 0, 0, 0, type_cnt
         log(f"[{course_name}] 待办已加载但没有目标视频，视为已刷完。")
-        return 0, len(all_items), 0
+        return 0, len(all_items), 0, type_cnt
 
     done = 0
     total = len(targets)
@@ -679,7 +679,7 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
             done += 1
             log(f"[快速模式] ({i + 1}/{total}) 跳过点击，直接切换: {t['name']}")
         log(f"[{course_name}] 快速模式遍历完成：共检测 {done} 条目标（未点击、未播放）")
-        return done, total, total  # remaining 保持原目标数（未实际刷，进度不算减少）
+        return done, total, total, type_cnt  # remaining 保持原目标数（未实际刷，进度不算减少）
 
     for i, t in enumerate(targets):
         if t["name"] in visited:
@@ -703,7 +703,7 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
         except Exception:
             pass
 
-    return done, len(targets), total
+    return done, len(targets), total, type_cnt
 
 
 def win_toast(title, message):
@@ -872,8 +872,8 @@ def run_parallel_worker(profile_dir, dwell, max_lessons, quick, headless, q):
                 log(f"########## 【{worker_tag}】领取课程：{course_name} ##########")
                 entry = {"txt": task["txt"]}
                 try:
-                    done, remaining, n_target = study_course(page, context, entry, dwell, max_lessons,
-                                                             quick=quick)
+                    done, remaining, n_target, type_dist = study_course(page, context, entry, dwell, max_lessons,
+                                                                         quick=quick)
                 except Exception as e:
                     log(f"[{course_name}] 本门课程出现异常，跳过: {str(e)[:150]}")
                     go_to_my_courses(page)
@@ -891,6 +891,7 @@ def run_parallel_worker(profile_dir, dwell, max_lessons, quick, headless, q):
                 info["target"] = n_target  # 该课的视频目标条数（0 = 无视频任务）
                 info["remaining"] = remaining
                 info["done"] = (remaining == 0)
+                info["type_dist"] = type_dist
                 updates[course_name] = info
                 save_progress_merge(updates)
                 if n_target == 0:
@@ -911,13 +912,32 @@ def run_parallel_worker(profile_dir, dwell, max_lessons, quick, headless, q):
     q.put((updates, total_done))
 
 
-def init_task_pool(entries):
-    """把课程列表写入共享任务池（tasks.json），供并行 worker 动态领取"""
-    tasks = [
-        {"name": e["txt"].split(" ")[0], "txt": e["txt"],
-         "status": "pending", "owner": ""}
-        for e in entries
-    ]
+def init_task_pool(entries, skip_no_task=False):
+    """把课程列表写入共享任务池（tasks.json），供并行 worker 动态领取。
+    skip_no_task=True（刷课模式）：跳过已确认无任务（target=0）的课程；
+    未检查过的课程正常进池，刷课时会现场检查一次（5 次重试仍空则按无任务记录，之后跳过）。
+    直到下次检查状态重新评估。"""
+    no_task_names = set()
+    if skip_no_task:
+        try:
+            prog = load_progress()
+            courses = prog.get("courses") or {}
+        except Exception:
+            courses = {}
+        no_task_names = {n for n, i in courses.items() if i.get("target", 0) == 0}
+        if no_task_names:
+            log(f"跳过 {len(no_task_names)} 门已确认无任务的课程（下次检查状态会重新评估）：")
+            for n in sorted(no_task_names):
+                log(f"  - {n}")
+    tasks = []
+    for e in entries:
+        name = e["txt"].split(" ")[0]
+        if name in no_task_names:
+            continue
+        tasks.append(
+            {"name": name, "txt": e["txt"],
+             "status": "pending", "owner": ""}
+        )
     try:
         with open(TASKS_FILE, "w", encoding="utf-8") as f:
             json.dump({"updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -1068,7 +1088,7 @@ def main(argv=None):
         parallel = 1  # 检查模式固定单窗口，不受并行数影响
     if parallel > 1:
         ensure_parallel_profiles(parallel)
-    init_task_pool(entries)
+    init_task_pool(entries, skip_no_task=not args.quick)
     log(f"{'并行' if parallel > 1 else '串行'}刷课：{parallel} 个窗口，动态领取课程（同一课程不会被重复领取）。")
 
     # 3) 启动 worker（并行 = 多进程动态领取；串行 = 单进程同样动态领取）

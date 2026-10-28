@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.7"        # 每次发新版前手动递增
+APP_VERSION = "1.0.8"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -156,8 +156,8 @@ class Console(QMainWindow):
         # ===== 中间分栏：表格 + 日志 =====
         split = QSplitter(Qt.Orientation.Horizontal)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["课程", "总目标", "剩余", "完成度", "状态"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["课程", "总目标", "剩余", "完成度", "状态", "类型分布"])
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
@@ -168,6 +168,7 @@ class Console(QMainWindow):
             hh.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(3, 180)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         split.addWidget(self.table)
 
         self.log_view = QPlainTextEdit()
@@ -490,6 +491,14 @@ class Console(QMainWindow):
             item_st.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             item_st.setForeground(QColor(st_color))
             self.table.setItem(row, 4, item_st)
+
+            # 类型分布（视频×N 课件×N …），无记录显示 —
+            td = info.get("type_dist") or {}
+            td_text = " ".join(f"{k}×{v}" for k, v in td.items()) if td else "—"
+            item_td = QTableWidgetItem(td_text)
+            item_td.setToolTip(td_text)
+            item_td.setForeground(QColor("#9aa0b4"))
+            self.table.setItem(row, 5, item_td)
 
     # ---------- 日志 ----------
     def refresh_log(self):
