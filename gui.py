@@ -25,13 +25,13 @@ import auto  # 内嵌核心刷课逻辑（打包后随本程序一起分发）
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.9"        # 每次发新版前手动递增
+APP_VERSION = "1.0.10"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -111,9 +111,14 @@ QProgressBar {
 }
 QProgressBar::chunk { border-radius: 5px; background-color: #5b6ee1; }
 QSplitter::handle { background-color: #33364a; width: 4px; }
-QScrollBar:vertical { background: #262833; width: 10px; border-radius: 5px; }
-QScrollBar::handle:vertical { background: #4a4f68; border-radius: 5px; min-height: 30px; }
-QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+QScrollBar:vertical { background: #262833; width: 12px; border-radius: 6px; }
+QScrollBar::handle:vertical { background: #4a4f68; border-radius: 6px; min-height: 40px; }
+QScrollBar::handle:vertical:hover { background: #5b6ee1; }
+QScrollBar:horizontal { background: #262833; height: 12px; border-radius: 6px; }
+QScrollBar::handle:horizontal { background: #4a4f68; border-radius: 6px; min-width: 40px; }
+QScrollBar::handle:horizontal:hover { background: #5b6ee1; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 """
 
 
@@ -170,8 +175,12 @@ class Console(QMainWindow):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
+        # 按像素平滑滚动，拖起来不卡手
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # 课程列也按内容最长自适应，避免窗口拉宽时留白
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         for col in (1, 2, 4):
             hh.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
@@ -523,6 +532,8 @@ class Console(QMainWindow):
             item_td.setToolTip(td_text)
             item_td.setForeground(QColor("#9aa0b4"))
             self.table.setItem(row, 5, item_td)
+
+        self.table.resizeColumnsToContents()
 
     # ---------- 日志 ----------
     def refresh_log(self):

@@ -885,9 +885,17 @@ def run_parallel_worker(profile_dir, dwell, max_lessons, quick, headless, q):
                     log(f"[{course_name}] 待办列表加载失败，本次跳过；进度记录保持不变。")
                     go_to_my_courses(page)
                     continue
-                info = updates.get(course_name, {"total": 0, "remaining": 0, "done": False})
-                if info.get("total", 0) == 0:
-                    info["total"] = n_target  # 总目标 = 视频目标条数（快速模式不翻倍）
+                info = updates.get(course_name)
+                if info is None:
+                    # 第一次写这课：读 progress.json 里已存的总数，避免把"总数"覆盖成当次未完成数
+                    saved_total = 0
+                    try:
+                        saved_total = (load_progress().get("courses", {}).get(course_name, {}) or {}).get("total", 0) or 0
+                    except Exception:
+                        pass
+                    info = {"total": saved_total, "remaining": 0, "done": False}
+                # 总目标只增不减：总数固定为历史最大值（刷掉的部分通过 remaining 体现，不会让总数变小）
+                info["total"] = max(info.get("total", 0), n_target)
                 info["target"] = n_target  # 该课的视频目标条数（0 = 无视频任务）
                 info["remaining"] = remaining
                 info["done"] = (remaining == 0)
