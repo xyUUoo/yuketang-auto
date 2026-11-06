@@ -24,8 +24,10 @@
     python auto.py --headless            # 完全无头模式（不显示窗口）
 """
 import argparse
+import atexit
 import ctypes
 import datetime
+import hashlib
 import json
 import multiprocessing
 import os
@@ -238,6 +240,18 @@ def find_course_entries(page):
 SEMESTER_RE = re.compile(r"(20\d{2})(春|秋)")
 
 
+def course_name_of(txt):
+    """课程卡片文字 → 课程名："Python Web程序设计实训 刘恋 2026秋-2024级…" → "Python Web程序设计实训"
+    规则：先切掉学期及之后的内容，再去掉末尾的教师名（2~4 个汉字且不是课程主体）。"""
+    txt = (txt or "").strip()
+    m = SEMESTER_RE.search(txt)
+    head = txt[: m.start()].strip() if m else txt
+    parts = head.split()
+    if len(parts) > 1 and 2 <= len(parts[-1]) <= 4 and all("\u4e00" <= ch <= "\u9fff" for ch in parts[-1]):
+        head = " ".join(parts[:-1]).strip()
+    return head or txt
+
+
 def filter_latest_semester(entries):
     """只保留最新学期的课程。返回 (学期标签, 该学期课程列表)"""
     tagged = []
@@ -267,19 +281,50 @@ def go_to_my_courses(page):
     page.wait_for_timeout(3000)
 
 
-def parse_todo_items(page):
-    """解析“未完成”待办列表：返回 (全部条目, 目标条目[视频+计分+未完成])"""
+TARGET_KINDS = ("视频", "课件")
+
+
+def normalize_item_type(t):
+    """待办类型归一：雨课堂会出现 视频 / 课件 / 作业 / 考试 / 开放型作业 等写法"""
+    t = (t or "").strip()
+    up = t.upper()
+    if "视频" in t:
+        return "视频"
+    if "课件" in t or "PPT" in up or "文档" in t or "讲义" in t:
+        return "课件"
+    if "作业" in t:
+        return "作业"
+    if "考试" in t or "测验" in t or "测试" in t:
+        return "考试"
+    return t or "其他"
+
+
+def is_unfinished_status(status):
+    s = (status or "").strip()
+    return "未" in s or "进行中" in s
+
+
+def parse_todo_items(page, kinds=TARGET_KINDS):
+    """解析“未完成”待办列表：返回 (全部条目, 目标条目)
+
+    目标 = 待学习条目：视频（计分）+ 课件（全部未完成课件）。
+    kinds 里没有的类型不参与刷课，只统计。"""
     try:
         items = page.evaluate(
             """() => {
                 const out = [];
+                const metaType = /^(视频|课件|作业|考试|开放型作业|讨论|文档|讲义)$/;
+                const metaWord = /计分|未开始|进行中|已完成|未完成|已过期|未学会/;
                 document.querySelectorAll('li.unfinished-study__item').forEach(li => {
                     const lines = (li.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
                     if (!lines.length) return;
                     const type = lines[0];
                     const scored = lines.some(l => l.includes('计分'));
-                    const status = lines.find(l => /未开始|进行中|已完成|未完成/.test(l)) || '未开始';
-                    const name = lines.find(l => /项目|课/.test(l) && l.length > 2) || (lines[1] || lines.join(' '));
+                    const status = lines.find(l => /未开始|进行中|已完成|未完成|已过期/.test(l)) || '未开始';
+                    let name = lines.find(l => !metaType.test(l) && !metaWord.test(l)
+                                            && /项目|课|章|节|讲/.test(l) && l.length > 2);
+                    if (!name) name = lines.find(l => !metaType.test(l) && !metaWord.test(l) && l.length > 2);
+                    if (!name) name = lines[1] || lines.join(' ');
                     out.push({type: type, scored: scored, status: status, name: name});
                 });
                 return out;
@@ -289,15 +334,37 @@ def parse_todo_items(page):
         log(f"parse_todo_items 失败: {e}")
         return [], []
     items = items or []
-    targets = [it for it in items
-               if it["type"] == "视频" and it["scored"] and "未" in it["status"]]
+    for it in items:
+        it["kind"] = normalize_item_type(it.get("type"))
+    targets = []
+    for it in items:
+        if not is_unfinished_status(it.get("status")):
+            continue
+        if it["kind"] == "视频" and it.get("scored") and "视频" in kinds:
+            targets.append(it)
+        elif it["kind"] == "课件" and "课件" in kinds:
+            targets.append(it)
     return items, targets
 
 
-def refresh_todo_list(page, retries=5, wait=3000):
+def count_target_kinds(items):
+    """统计待办里「视频/课件」各自的未完成条数（与本次只刷哪一类无关）"""
+    d = {}
+    for it in items or []:
+        if not is_unfinished_status(it.get("status")):
+            continue
+        k = it.get("kind")
+        if k == "视频" and it.get("scored"):
+            d[k] = d.get(k, 0) + 1
+        elif k == "课件":
+            d[k] = d.get(k, 0) + 1
+    return d
+
+
+def refresh_todo_list(page, retries=5, wait=3000, kinds=TARGET_KINDS):
     """确认待办列表状态并解析。返回 (all_items, targets, state)
     state: 'ok'=列表正常 | 'empty'=页面显示“暂无未完成” | 'fail'=多次重试仍加载不出来"""
-    all_items, targets = parse_todo_items(page)
+    all_items, targets = parse_todo_items(page, kinds)
     if all_items:
         return all_items, targets, "ok"
     attempt = 0
@@ -309,7 +376,7 @@ def refresh_todo_list(page, retries=5, wait=3000):
         attempt += 1
         log(f"待办列表尚未加载出来（第 {attempt}/{retries} 次重试）……")
         page.wait_for_timeout(wait)
-        all_items, targets = parse_todo_items(page)
+        all_items, targets = parse_todo_items(page, kinds)
         if all_items:
             return all_items, targets, "ok"
     return [], [], "fail"
@@ -348,65 +415,577 @@ def handle_quiz(page):
         page.wait_for_timeout(15000)
 
 
-def lesson_progress(page):
-    """读取学习页“学习进度：x/y”（课件类）"""
+LEARN_RE = re.compile(r"学习进度[：:]\s*(\d+)\s*/\s*(\d+)")
+NUM_PAIR_RE = re.compile(r"(?<!\d)(\d{1,4})\s*/\s*(\d{1,4})(?!\d)")
+
+
+def _frames_of(page):
+    """页面本身 + 所有 iframe：课件可能嵌在 iframe 里，只在主文档里找会漏"""
+    out = [page]
     try:
-        m = re.search(r"学习进度[：:]\s*(\d+)/(\d+)", page_text(page, 1500))
-        if m:
-            return int(m[1]), int(m[2])
+        out += list(page.frames)
     except Exception:
         pass
+    return out
+
+
+def _frame_text(target, max_len=1200):
+    try:
+        return target.evaluate(
+            "(n) => { const b = document.body; return b ? (b.innerText || '').slice(0, n) : ''; }",
+            max_len,
+        ) or ""
+    except Exception:
+        return ""
+
+
+def _read_texts(page, max_len=1200):
+    out = []
+    for t in _frames_of(page):
+        txt = _frame_text(t, max_len)
+        if txt.strip():
+            out.append(txt)
+    return out
+
+
+def lesson_progress(page):
+    """读取学习页“学习进度：x/y”（课件类），主页面与 iframe 都查"""
+    for txt in _read_texts(page, 1500):
+        m = LEARN_RE.search(txt)
+        if m:
+            return int(m.group(1)), int(m.group(2))
     return None, None
 
 
-def ppt_mode(page, dwell, name):
-    """课件（图片 PPT）翻页模式：按大纲页码逐页停留"""
-    pages = page.locator(".page")
-    total = pages.count()
-    log(f"[{name}] PPT 课件，共 {total} 页，每页停留 {dwell} 秒")
-    if total == 0:
-        log("未找到页码元素(.page)，无法翻页")
-        return False
+def _slide_image_digest(page):
+    """无进度/无页码时的兜底判据：对页面中部截图取指纹（图片型 PPT 文字不变也能判断翻页）"""
     try:
-        cont = page.get_by_role("button", name="继续观看")
-        if cont.count() and cont.first.is_visible():
-            cont.first.click(timeout=3000)
-            page.wait_for_timeout(3000)
+        vp = page.viewport_size or {"width": 1280, "height": 800}
+        clip = {
+            "x": int(vp["width"] * 0.18),
+            "y": int(vp["height"] * 0.12),
+            "width": int(vp["width"] * 0.64),
+            "height": int(vp["height"] * 0.58),
+        }
+        shot = page.screenshot(clip=clip, type="jpeg", quality=40, timeout=8000)
+        return hashlib.md5(shot).hexdigest()[:12]
+    except Exception as e:
+        log(f"截图指纹获取失败（本轮改用文字判据）: {str(e)[:100]}")
+        return None
+
+
+def courseware_state(page):
+    """课件页状态：学习进度 + 页码对（+ 无进度时的截图指纹）"""
+    cur, total = lesson_progress(page)
+    texts = _read_texts(page, 1200)
+    pair = None
+    for txt in texts:
+        pairs = NUM_PAIR_RE.findall(txt)
+        if pairs:
+            a, b = pairs[-1]
+            if int(b) >= int(a) and int(b) > 0:
+                pair = (int(a), int(b))
+                break
+    img = None
+    if cur is None and pair is None:
+        img = _slide_image_digest(page)
+    return {"cur": cur, "total": total, "pair": pair, "img": img}
+
+
+def _state_advanced(before, after):
+    """判断翻页是否真的生效：学习进度 +1 > 页码变化 > 截图指纹变化"""
+    if after["cur"] is not None and before["cur"] is not None and after["cur"] > before["cur"]:
+        return True
+    if after["pair"] and before["pair"] and after["pair"][0] > before["pair"][0]:
+        return True
+    if after["img"] and before["img"] and after["img"] != before["img"]:
+        return True
+    return False
+
+
+def _click_visible(loc, timeout=2500):
+    try:
+        if loc.count():
+            first = loc.first
+            if first.is_visible():
+                first.click(timeout=timeout)
+                return True
     except Exception:
         pass
-    for i in range(total):
+    return False
+
+
+NEXT_BUTTON_TEXTS = ("下一页", "下一张", "下页", "下一步", "下一节")
+NEXT_CSS = (
+    "[aria-label*='下一']",
+    "[title*='下一']",
+    "[aria-label*='next']",
+    "[title*='next']",
+    "button[class*='next']",
+    "[class*='next-btn']",
+    "[class*='nextPage']",
+    "[class*='next-page']",
+    "[class*='arrow-right']",
+    "[class*='ArrowRight']",
+)
+
+
+class CoursewarePager:
+    """课件翻页策略集合：按钮 → 图标 → 键盘 → 大纲缩略图 → 滚动。
+    每个策略单独试探一次，哪招生效就锁定优先复用；失效再换下一招。"""
+
+    KEYS = ("ArrowRight", "PageDown", "Space", "ArrowDown")
+
+    def __init__(self, page, name=""):
+        self.page = page
+        self.name = name
+        self.used = None
+        self.key_idx = 0
+        self.thumb_idx = 1
+
+    def labels(self):
+        return ("按钮", "图标", "键盘", "缩略图", "滚动")
+
+    def run(self, label, want=None):
+        fn = {
+            "按钮": self._by_button,
+            "图标": self._by_icon,
+            "键盘": self._by_key,
+            "缩略图": self._by_thumb,
+            "滚动": self._by_scroll,
+        }[label]
+        if label == "缩略图":
+            return fn(want)
+        return fn()
+
+    def _by_button(self):
+        p = self.page
+        for txt in NEXT_BUTTON_TEXTS:
+            for getter in (p.get_by_role("button", name=re.compile(txt)),
+                           p.get_by_role("link", name=re.compile(txt)),
+                           p.get_by_text(txt, exact=False)):
+                if _click_visible(getter):
+                    return True
+        return False
+
+    def _by_icon(self):
+        p = self.page
+        for sel in NEXT_CSS:
+            try:
+                loc = p.locator(sel)
+                cnt = min(loc.count(), 5)
+            except Exception:
+                continue
+            for i in range(cnt):
+                try:
+                    el = loc.nth(i)
+                    if el.is_visible():
+                        el.click(timeout=2500)
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _by_key(self):
+        p = self.page
         try:
-            pg = pages.nth(i)
-            if not pg.is_visible():
-                pg.scroll_into_view_if_needed(timeout=3000)
-            pg.click(timeout=5000)
-        except Exception as e:
-            log(f"点击第 {i + 1} 页失败: {e}")
+            vp = p.viewport_size or {"width": 1280, "height": 800}
+            # 点画面中部偏上：让幻灯片区域拿到焦点，同时避开左右工具栏
+            p.mouse.click(vp["width"] * 0.5, vp["height"] * 0.45)
+            p.wait_for_timeout(250)
+        except Exception:
+            pass
+        key = self.KEYS[self.key_idx % len(self.KEYS)]
+        self.key_idx += 1
+        try:
+            p.keyboard.press(key)
+            return True
+        except Exception:
+            return False
+
+    def _by_thumb(self, want=None):
+        """点左侧大纲/缩略图里页码等于目标页的那一项（找不到就按序号顺推）"""
+        p = self.page
+        sel = (".page, [class*='thumb'], [class*='catalog'] li, "
+               "[class*='outline'] li, [class*='slide-list'] li, [class*='menu'] li, "
+               "ul li, ol li")
+        try:
+            loc = p.locator(sel)
+            cnt = min(loc.count(), 300)
+        except Exception:
+            return False
+        for i in range(cnt):
+            try:
+                el = loc.nth(i)
+                if not el.is_visible():
+                    continue
+                txt = (el.inner_text() or "").strip()
+                # 页码文本可能是 "1" / "第1页" / "01"，容忍少量前后缀
+                m = re.match(r"^\D{0,2}(\d{1,4})\D{0,2}$", txt)
+                if not m:
+                    continue
+                no = int(m.group(1))
+                if want is not None and no != want:
+                    continue
+                if want is None and no <= self.thumb_idx:
+                    continue
+                el.click(timeout=2500)
+                self.thumb_idx = no
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _by_scroll(self):
+        p = self.page
+        try:
+            vp = p.viewport_size or {"width": 1280, "height": 800}
+            p.mouse.move(vp["width"] * 0.5, vp["height"] * 0.6)
+            p.mouse.wheel(0, int(vp["height"] * 0.8))
+            return True
+        except Exception:
+            return False
+
+
+def _page_video_state(page):
+    try:
+        return page.evaluate(
+            """() => {
+                const v = document.querySelector('video');
+                if (!v) return null;
+                return {paused: v.paused, ended: v.ended,
+                        t: Math.round(v.currentTime), d: Math.round(v.duration || 0)};
+            }"""
+        )
+    except Exception:
+        return None
+
+
+def _dwell_on_page(page, dwell, name):
+    """停留在当前页：支持暂停、弹题作答；页面内嵌视频则等它播完再算停留时间"""
+    video_waited = 0
+    waited = 0.0
+    while waited < dwell:
+        if wait_if_paused(page, name):
+            waited = 0.0
             continue
-        page.wait_for_timeout(1500)
-        txt = page_text(page, 800).replace("\n", " ").strip()
-        log(f"[{name}] 第 {i + 1}/{total} 页（停留 {dwell} 秒）文字: {txt[:120]}")
+        page.wait_for_timeout(1000)
+        waited += 1.0
         if check_quiz(page):
             handle_quiz(page)
-        waited = 0
-        while waited < dwell:
-            if wait_if_paused(page, name):
-                waited = 0
+            waited = 0.0
+            continue
+        st = _page_video_state(page)
+        if st and not st["ended"] and (st["d"] == 0 or st["t"] < st["d"] - 1):
+            # 课件里嵌了视频：先把视频放完（最多等 2 倍时长 + 60s），停留时间暂不计
+            force_mute(page)
+            try:
+                page.evaluate(
+                    """() => { const v = document.querySelector('video');
+                        if (v) { v.muted = true; v.volume = 0; const p = v.play(); if (p) p.catch(()=>{}); } }"""
+                )
+            except Exception:
+                pass
+            video_waited += 1.0
+            waited = max(0.0, waited - 1.0)
+            if st["d"] and video_waited > st["d"] * 2 + 60:
+                log(f"[{name}] 页内视频等待超时（{st['t']}/{st['d']}），继续翻页")
+                return
+
+
+def dump_courseware_diag(page, name):
+    """翻页卡住时输出页面结构诊断，方便定位该课程课件的真实 DOM"""
+    log(f"[{name}] 课件翻页未生效，输出页面诊断（便于后续适配）：")
+    try:
+        for t in _frames_of(page):
+            txt = _frame_text(t, 300).replace("\n", " ")
+            log(f"  frame: {str(getattr(t, 'url', ''))[:90]} | text: {txt[:160]}")
+    except Exception:
+        pass
+    try:
+        info = page.evaluate(
+            """() => {
+                const out = {iframe: document.querySelectorAll('iframe').length, els: []};
+                const sel = 'button,[role=button],svg,[class*=page],[class*=slide],[class*=next],[class*=thumb]';
+                document.querySelectorAll(sel).forEach(e => {
+                    if (out.els.length >= 40) return;
+                    const r = e.getBoundingClientRect();
+                    if (r.width * r.height < 200) return;
+                    out.els.push({
+                        tag: e.tagName,
+                        cls: (e.className || '').toString().slice(0, 36),
+                        txt: ((e.innerText || '') + '').trim().slice(0, 16)
+                    });
+                });
+                return out;
+            }"""
+        )
+        log(f"  主文档 iframe 数量: {info.get('iframe')}")
+        for b in info.get("els", [])[:25]:
+            log(f"    元素 <{b['tag']}> class={b['cls']} text={b['txt']}")
+    except Exception as e:
+        log(f"  诊断信息获取失败: {str(e)[:120]}")
+
+
+COURSEWARE_UNREAD_JS = """() => {
+    const out = [];
+    document.querySelectorAll('span.page').forEach(sp => {
+        const slide = sp.closest('.swiper-slide');
+        if (!slide) return;
+        const flag = slide.querySelector('span.flag.noRead');
+        if (flag && (flag.offsetWidth || flag.offsetHeight)) out.push(parseInt(sp.innerText.trim()));
+    });
+    return out.sort((a, b) => a - b);
+}"""
+
+COURSEWARE_ACTIVE_JS = """() => {
+    const t = document.querySelector('.thumb-swiper-slide-active span.page')
+           || document.querySelector('.thumb-swiper-slide-active .page');
+    return t ? parseInt(t.innerText.trim()) : null;
+}"""
+
+TOTAL_PAGES_RE = re.compile(r"共\s*(\d+)\s*页")
+
+
+def courseware_unread_pages(page):
+    """大纲里仍带“未读”标记的页码（雨课堂用 span.flag.noRead 标记未读页）"""
+    try:
+        return page.evaluate(COURSEWARE_UNREAD_JS) or []
+    except Exception:
+        return []
+
+
+def courseware_active_page(page):
+    """大纲当前高亮的页码"""
+    try:
+        return page.evaluate(COURSEWARE_ACTIVE_JS)
+    except Exception:
+        return None
+
+
+def courseware_total_pages(page):
+    """总页数：优先“学习进度 x/y”的 y，其次大纲标题“共 N 页”"""
+    cur, total = lesson_progress(page)
+    if total:
+        return total
+    for txt in _read_texts(page, 800):
+        m = TOTAL_PAGES_RE.search(txt)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def click_courseware_thumb(page, n):
+    """点大纲缩略图里的第 n 页（缩略图在 swiper 里，先滚到可见再点）"""
+    for scope in ("div.swiper-container.pptThumbsSwiper", "[class*='pptThumbsSwiper']"):
+        try:
+            thumbs = page.locator(scope)
+            if thumbs.count() == 0:
                 continue
-            page.wait_for_timeout(2000)
-            waited += 2
-            if check_quiz(page):
-                handle_quiz(page)
-            a, b = lesson_progress(page)
-            if a is not None and b and a >= b:
-                log(f"[{name}] 进度已满 {a}/{b}，提前结束翻页")
+            pg = thumbs.first.locator("span.page").filter(has_text=re.compile(rf"^{n}$"))
+            if pg.count():
+                pg.first.scroll_into_view_if_needed(timeout=3000)
+                pg.first.click(timeout=4000)
                 return True
-    a, b = lesson_progress(page)
-    if a is not None and b:
-        log(f"[{name}] 翻页完成，学习进度：{a}/{b}")
-        return a >= b
-    log(f"[{name}] 翻页完成，未能确认进度，视为完成。")
-    return True
+        except Exception:
+            continue
+    return False
+
+
+def wait_page_read(page, n, max_wait, name):
+    """等到第 n 页的“未读”标记消失（= 前端确认已读）；返回 (是否消失, 耗时)"""
+    start = time.time()
+    min_hold = 2.0  # 最短停留：页面每页上报有节流，停留太短服务端会漏记
+    while True:
+        page.wait_for_timeout(400)
+        elapsed = time.time() - start
+        if wait_if_paused(page, name):
+            start = time.time()
+            continue
+        if check_quiz(page):
+            handle_quiz(page)
+            start = time.time()
+        gone = n not in courseware_unread_pages(page)
+        if gone and elapsed < min_hold:
+            page.wait_for_timeout(int((min_hold - elapsed) * 1000))
+            gone = n not in courseware_unread_pages(page)
+        if gone:
+            return True, round(time.time() - start, 1)
+        if elapsed >= max_wait:
+            return False, round(elapsed, 1)
+
+
+def courseware_outline_mode(page, dwell, name, total, unread):
+    """大纲驱动翻页：按页码点缩略图 → 等“未读”消失 → 立刻下一页。
+    dwell 在这里是最长等待（兜底），正常情况下每页只花 1~2 秒。"""
+    cur, _ = lesson_progress(page)
+    log(f"[{name}] 大纲驱动模式：共 {total} 页，未读 {len(unread)} 页，未读标记消失即翻页（最长等 {dwell}s/页）")
+
+    missed = 0
+    for n in unread:
+        cur, _ = lesson_progress(page)
+        if cur is not None and total and cur >= total:
+            break
+        if not click_courseware_thumb(page, n):
+            log(f"[{name}] 点击大纲第 {n} 页失败，尝试键盘翻页")
+            page.keyboard.press("ArrowRight")
+        confirmed, cost = wait_page_read(page, n, dwell, name)
+        if confirmed:
+            cur, _ = lesson_progress(page)
+            log(f"[{name}] 第 {n} 页已读确认（{cost}s）｜进度 {cur}/{total}")
+        else:
+            missed += 1
+            log(f"[{name}] 第 {n} 页等 {cost}s 仍未消“未读”，先继续下一页（最后以学习进度为准）")
+
+    # 收尾校验：前端消“未读”比服务端落库快，多等几轮，把掉队的页补上再收工
+    stable = 0
+    for attempt in range(1, 6):
+        page.wait_for_timeout(8000)
+        remain = courseware_unread_pages(page)
+        cur, _ = lesson_progress(page)
+        if not remain and total and cur is not None and cur >= total:
+            stable += 1
+            log(f"[{name}] 校验 {attempt}：未读 0 页、进度 {cur}/{total}")
+            if stable >= 2:
+                log(f"[{name}] 连续两次校验通过，课件完成")
+                return True
+            continue
+        stable = 0
+        if remain:
+            log(f"[{name}] 校验 {attempt}：仍有 {len(remain)} 页未读 {remain[:8]}，补刷……")
+            for n in remain:
+                if not click_courseware_thumb(page, n):
+                    page.keyboard.press("ArrowRight")
+                confirmed, cost = wait_page_read(page, n, dwell, name)
+                log(f"[{name}] 补刷第 {n} 页{'成功' if confirmed else '未确认'}（{cost}s）")
+        else:
+            log(f"[{name}] 校验 {attempt}：无未读标记，但进度 {cur}/{total} 未满，等服务端补齐")
+
+    cur, _ = lesson_progress(page)
+    remain = courseware_unread_pages(page)
+    if total and cur is not None and cur >= total and not remain:
+        log(f"[{name}] 学习进度已满 {cur}/{total}，课件完成")
+        return True
+    log(f"[{name}] 翻页结束：进度 {cur}/{total}，仍有 {len(remain)} 页未读（未确认的 {missed} 页）")
+    return False
+
+
+def _pager_mode(page, dwell, name, max_pages, st):
+    """兜底模式：没有大纲/未读标记时，用按钮/图标/键盘/滚动逐步试探翻页"""
+    total = st["total"]
+    pager = CoursewarePager(page, name)
+    labels = list(pager.labels())
+    turns = 0
+    cap = max_pages if max_pages > 0 else (total or 200)
+    dead_rounds = 0
+    guard = 0
+    limit = (total or 200) * 2 + 60
+
+    while guard < limit:
+        guard += 1
+        if wait_if_paused(page, name):
+            st = courseware_state(page)
+            continue
+        if check_quiz(page):
+            handle_quiz(page)
+            st = courseware_state(page)
+            continue
+
+        cur, total = st["cur"], st["total"]
+        if total and cur is not None and cur >= total:
+            log(f"[{name}] 已到最后一页（学习进度 {cur}/{total}）")
+            return True
+        if turns >= cap:
+            log(f"[{name}] 已达本次翻页上限 {cap} 页，停止")
+            return total is not None and cur is not None and cur >= total
+
+        before = st
+        order = labels if not pager.used else [pager.used] + [l for l in labels if l != pager.used]
+        unlocked = False
+        for label in order:
+            want = None
+            if label == "缩略图":
+                if before["cur"] is not None:
+                    want = before["cur"] + 1
+                elif before["pair"]:
+                    want = before["pair"][0] + 1
+            if not pager.run(label, want):
+                continue
+            page.wait_for_timeout(1200)
+            after = courseware_state(page)
+            if _state_advanced(before, after):
+                st = after
+                turns += 1
+                dead_rounds = 0
+                pager.used = label
+                blocked = ""
+                if after["cur"] is not None:
+                    blocked = f"{after['cur']}/{after['total']}"
+                elif after["pair"]:
+                    blocked = f"{after['pair'][0]}/{after['pair'][1]}"
+                log(f"[{name}] 翻到第 {turns + 1} 页（{label}）{('｜进度 ' + blocked) if blocked else ''}")
+                _dwell_on_page(page, dwell, name)
+                st = courseware_state(page)
+                unlocked = True
+                break
+            log(f"[{name}] 策略“{label}”本次未翻动页面，换下一招")
+
+        if unlocked:
+            continue
+        dead_rounds += 1
+        if dead_rounds >= 2:
+            if total is None and turns > 0:
+                log(f"[{name}] 已翻到最后一页（页数未在学生端标注，未能确认学习进度），按完成处理")
+                return True
+            log(f"[{name}] 所有翻页策略连续 {dead_rounds} 轮都无效，本条目未确认完成")
+            dump_courseware_diag(page, name)
+            return False
+        page.wait_for_timeout(1500)
+
+    log(f"[{name}] 翻页循环达到上限（{limit} 次），停止")
+    return False
+
+
+def courseware_mode(page, dwell, name, max_pages=0):
+    """课件（PPT/文档）学习模式。
+
+    首选「大纲驱动」：点大纲缩略图翻页，当前页的“未读”标记一消失就翻下一页
+    （服务端记阅读只要 1 秒左右，比固定停留快 5~8 倍）。
+    读不到大纲/未读标记时退回按钮/键盘/滚动试探模式。"""
+    log(f"[{name}] 进入课件学习模式（每页最长等 {dwell}s）")
+    for txt in ("继续观看", "继续学习", "开始学习"):
+        try:
+            if _click_visible(page.get_by_role("button", name=re.compile(txt)), 3000):
+                log(f"[{name}] 点击「{txt}」进入课件")
+                page.wait_for_timeout(2500)
+                break
+        except Exception:
+            pass
+
+    page.wait_for_timeout(1200)
+    total = courseware_total_pages(page)
+    unread = courseware_unread_pages(page)
+    cur, _ = lesson_progress(page)
+
+    if total:
+        log(f"[{name}] 课件共 {total} 页，学习进度 {cur}/{total}，未读 {len(unread)} 页")
+    elif unread:
+        log(f"[{name}] 未读到总页数，未读 {len(unread)} 页")
+    else:
+        log(f"[{name}] 未读到页码/未读标记，改用按钮/键盘翻页模式")
+
+    if total and not unread and cur is not None and cur >= total:
+        log(f"[{name}] 学习进度已满 {cur}/{total}，无需翻页")
+        return True
+    if unread:
+        return courseware_outline_mode(page, dwell, name, total or len(unread), unread)
+
+    return _pager_mode(page, dwell, name, max_pages, courseware_state(page))
+
+
+def ppt_mode(page, dwell, name, max_pages=0):
+    """兼容旧调用名：转调 courseware_mode"""
+    return courseware_mode(page, dwell, name, max_pages=max_pages)
 
 
 def force_mute(page):
@@ -425,6 +1004,34 @@ def force_mute(page):
 
 
 PAUSE_FILE = os.path.join(BASE_DIR, "pause.flag")
+RUN_LOCK = os.path.join(BASE_DIR, "run.lock")
+
+
+def write_run_lock(kinds=(), parallel=1):
+    """主进程写 run.lock（pid/启动时间/类型），控制台据此识别“外部启动的刷课任务”，
+    即使脚本是从命令行启动的，控制台的开始/暂停/结束按钮也能接管它。"""
+    if multiprocessing.current_process().name != "MainProcess":
+        return
+    info = {
+        "pid": os.getpid(),
+        "start": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "types": list(kinds),
+        "parallel": parallel,
+    }
+    try:
+        with open(RUN_LOCK, "w", encoding="utf-8") as f:
+            json.dump(info, f, ensure_ascii=False)
+    except Exception:
+        pass
+    atexit.register(clear_run_lock)
+
+
+def clear_run_lock():
+    try:
+        if os.path.exists(RUN_LOCK):
+            os.remove(RUN_LOCK)
+    except Exception:
+        pass
 
 
 def wait_if_paused(page, name=""):
@@ -566,10 +1173,29 @@ def video_mode(page, name, quick=False):
             last_t = st["t"]
 
 
+def has_courseware_markers(page):
+    """页面是否有课件特征元素（幻灯片/页码/缩略图），用于区分“课件”和“视频型课件”"""
+    try:
+        n = page.evaluate(
+            """() => {
+                let c = 0;
+                for (const el of document.querySelectorAll('[class*=slide],[class*=page],[class*=ppt],[class*=thumb]')) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 80 && r.height > 60) c++;
+                }
+                return c;
+            }"""
+        )
+        return bool(n)
+    except Exception:
+        return False
+
+
 def study_one(page, context, item, dwell, unfinished_url, quick=False):
     """刷单个待办条目（视频/课件），完成后返回未完成列表页"""
     name = item["name"]
-    log(f"===== 开始学习: {name} | 类型={item['type']} | 状态={item['status']} =====")
+    kind = item.get("kind") or normalize_item_type(item.get("type"))
+    log(f"===== 开始学习: {name} | 类型={kind} | 状态={item['status']} =====")
     before_tabs = len(context.pages)
     try:
         loc = page.locator("li.unfinished-study__item").filter(has_text=name).first
@@ -587,8 +1213,7 @@ def study_one(page, context, item, dwell, unfinished_url, quick=False):
             pass
         page.wait_for_timeout(4000)
 
-    # 学习页判断：有 video 则视频模式，否则按课件翻页。
-    # 视频是懒加载的（进入页面几秒后才挂 <video>），轮询最多 12 秒，避免误判成课件
+    # 学习页判断：视频是懒加载的（进入页面几秒后才挂 <video>），轮询最多 12 秒
     has_video = False
     for _ in range(8):
         try:
@@ -599,18 +1224,29 @@ def study_one(page, context, item, dwell, unfinished_url, quick=False):
             pass
         page.wait_for_timeout(1500)
 
-    if has_video:
-        ok = video_mode(page, name, quick=quick)
+    if kind == "课件":
+        cur, total = lesson_progress(page)
+        # 视频型课件（整页就一个视频、没有幻灯片/页码）：直接按视频刷，避免翻页策略空转
+        if total is None and has_video and not has_courseware_markers(page):
+            log(f"[{name}] 该课件条目实际是视频型，改走视频播放模式")
+            ok = video_mode(page, name, quick=quick)
+        else:
+            ok = courseware_mode(page, dwell, name)
+            if not ok and has_video:
+                log(f"[{name}] 课件模式未完成但检测到视频，补一次视频播放")
+                ok = video_mode(page, name, quick=quick)
     else:
-        ok = ppt_mode(page, dwell, name)
-        # 课件模式失败（如 .page 元素不存在）：回头再确认一次是否有 video（懒加载更慢的情况）
-        if not ok:
-            try:
-                if page.locator("video").count() > 0:
-                    log(f"[{name}] 课件模式失败但检测到视频，改走视频播放模式")
-                    ok = video_mode(page, name, quick=quick)
-            except Exception:
-                pass
+        if has_video:
+            ok = video_mode(page, name, quick=quick)
+        else:
+            ok = courseware_mode(page, dwell, name)
+            if not ok:
+                try:
+                    if page.locator("video").count() > 0:
+                        log(f"[{name}] 课件模式失败但检测到视频，改走视频播放模式")
+                        ok = video_mode(page, name, quick=quick)
+                except Exception:
+                    pass
 
     # 返回未完成列表页（SPA 同页跳转，直接 goto 带 tab=unfinished 的 URL 最稳）
     try:
@@ -623,7 +1259,7 @@ def study_one(page, context, item, dwell, unfinished_url, quick=False):
 
 def open_course(page, entry):
     """从课程列表页点击进入课程，返回课程名（找不到卡片时关弹窗+刷新重试）"""
-    course_name = entry["txt"].split(" ")[0]
+    course_name = course_name_of(entry["txt"])
     log(f"进入课程: {entry['txt'][:60]}")
     card = page.locator("div.lesson-cardS").filter(has_text=course_name).first
     for attempt in range(3):
@@ -650,8 +1286,9 @@ def open_course(page, entry):
     raise RuntimeError(f"多次重试仍无法进入课程 {course_name}")
 
 
-def study_course(page, context, entry, dwell, max_lessons, quick=False):
-    """刷单门课程：进课程 -> 未完成 -> 逐个刷目标。返回 (本次刷完数, 该课剩余目标数)"""
+def study_course(page, context, entry, dwell, max_lessons, quick=False, kinds=TARGET_KINDS):
+    """刷单门课程：进课程 -> 未完成 -> 逐个刷目标（视频/课件）。
+    返回 (本次刷完数, 该课剩余目标数, 目标总数, 类型分布, 目标分类计数, 剩余分类计数)"""
     course_name = open_course(page, entry)
 
     log("点击“未完成”……")
@@ -661,8 +1298,20 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
     log(f"未完成列表 URL: {unfinished_url}")
 
     # 解析待办（异步加载，0 条时重试；页面显示“暂无未完成”则直接跳过）
-    all_items, targets, state = refresh_todo_list(page)
-    log(f"[{course_name}] 待办共 {len(all_items)} 条，目标（视频+计分+未完成）：{len(targets)} 条")
+    all_items, targets, state = refresh_todo_list(page, kinds=kinds)
+    # 分类计数按“全部目标类型”算，与本次只刷视频/只刷课件无关，
+    # 否则只跑一类时会把另一类的剩余清零（导致误标「无任务」）
+    kinds_all = count_target_kinds(all_items)
+    targets_in_run = {}  # 本次要刷的（受 kinds 过滤）
+    for it in targets:
+        k = it.get("kind") or "其他"
+        targets_in_run[k] = targets_in_run.get(k, 0) + 1
+    kinds_in_targets = kinds_all
+    kind_rem = dict(kinds_all)
+    kind_txt = "、".join(f"{k}{v}条" for k, v in kinds_all.items()) or "无"
+    run_txt = "、".join(f"{k}{v}条" for k, v in targets_in_run.items()) or "无"
+    log(f"[{course_name}] 待办共 {len(all_items)} 条，视频/课件未完成 {sum(kinds_all.values())} 条"
+        f"（{kind_txt}）；本次刷（{'/'.join(kinds)}）：{len(targets)} 条（{run_txt}）")
     # 未完成条目类型分布（视频/课件/作业/其他，按页面原始类型文字统计）
     type_cnt = {}
     for it in all_items:
@@ -683,12 +1332,19 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
     if not targets:
         if state == "empty":
             log(f"[{course_name}] 暂无未完成待办，视为已刷完。")
-            return 0, 0, 0, type_cnt
+            return 0, 0, 0, type_cnt, {}, {}
         if state == "fail":
-            log(f"[{course_name}] 多次重试（5 次）后待办仍为空，按无任务处理（之后刷课跳过，下次检查重新评估）。")
-            return 0, 0, 0, type_cnt
-        log(f"[{course_name}] 待办已加载但没有目标视频，视为已刷完（无视频任务，刷课跳过，下次检查重新评估）。")
-        return 0, 0, 0, type_cnt  # remaining 归零：与 target=0 保持自洽（GUI 显示"无任务"，不显示残留剩余数）
+            log(f"[{course_name}] 多次重试（5 次）后待办仍为空（多半是浏览器被关/网络断了），"
+                f"本次不写进度记录，留待下次重新评估。")
+            return 0, None, 0, type_cnt, {}, {}  # remaining=None → 调用方跳过写盘，避免把课程误标成“无任务”
+        remaining_all = sum(kinds_all.values())
+        if remaining_all:
+            # 本次只跑了一类，而待办里剩下的都是另一类 —— 不能当成“已刷完”
+            log(f"[{course_name}] 本次只刷（{'/'.join(kinds)}），"
+                f"但待办里还有 {remaining_all} 条（{kind_txt}）未完成，本课跳过，留待刷另一类时处理。")
+            return 0, remaining_all, remaining_all, type_cnt, kinds_all, dict(kinds_all)
+        log(f"[{course_name}] 待办已加载但没有目标条目（视频/课件），视为已刷完（刷课跳过，下次检查重新评估）。")
+        return 0, 0, 0, type_cnt, {}, {}  # remaining 归零：与 target=0 保持自洽（GUI 显示"无任务"）
 
     done = 0
     total = len(targets)
@@ -703,7 +1359,8 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
             done += 1
             log(f"[快速模式] ({i + 1}/{total}) 跳过点击，直接切换: {t['name']}")
         log(f"[{course_name}] 快速模式遍历完成：共检测 {done} 条目标（未点击、未播放）")
-        return done, total, total, type_cnt  # remaining 保持原目标数（未实际刷，进度不算减少）
+        all_rem = sum(kinds_all.values())
+        return done, all_rem, all_rem, type_cnt, kinds_all, dict(kinds_all)  # remaining 保持原目标数（未实际刷）
 
     for i, t in enumerate(targets):
         if t["name"] in visited:
@@ -719,15 +1376,18 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
         # 重新加载未完成列表，更新状态（已完成的条目会消失）
         try:
             page.goto(unfinished_url, timeout=60000, wait_until="domcontentloaded")
-            _, targets, _ = refresh_todo_list(page)
+            all_items, targets, _ = refresh_todo_list(page, kinds=kinds)
+            # 分类剩余用「全部目标类型」统计，避免只刷一类时把另一类清零
+            kind_rem = count_target_kinds(all_items) or kind_rem
             targets = [t for t in targets if t["name"] not in visited]
             if not targets:
-                log(f"[{course_name}] 列表已无目标条目，全部完成。")
+                log(f"[{course_name}] 本次类型已无目标条目。")
                 break
         except Exception:
             pass
 
-    return done, len(targets), total, type_cnt
+    remaining_all = sum(kind_rem.values())
+    return done, remaining_all, sum(kinds_all.values()), type_cnt, kinds_all, dict(kind_rem)
 
 
 def win_toast(title, message):
@@ -861,7 +1521,7 @@ QPushButton:pressed { background-color: #4a5bc0; }
         log(f"完成弹窗显示失败（已降级为日志提示）: {str(e)[:100]}")
 
 
-def run_parallel_worker(profile_dir, dwell, max_lessons, quick, headless, q):
+def run_parallel_worker(profile_dir, dwell, max_lessons, quick, headless, q, kinds=TARGET_KINDS):
     """并行 worker（独立进程）：从共享任务池动态领取课程，刷完领下一个；
     没有可刷课程时自动关闭本窗口退出。结果 (updates, total_done) 放入队列 q。"""
     worker_tag = os.path.basename(profile_dir)
@@ -899,8 +1559,8 @@ def run_parallel_worker(profile_dir, dwell, max_lessons, quick, headless, q):
                 log(f"########## 【{worker_tag}】领取课程：{course_name} ##########")
                 entry = {"txt": task["txt"]}
                 try:
-                    done, remaining, n_target, type_dist = study_course(page, context, entry, dwell, max_lessons,
-                                                                         quick=quick)
+                    done, remaining, n_target, type_dist, kind_cnt, kind_rem = study_course(
+                        page, context, entry, dwell, max_lessons, quick=quick, kinds=kinds)
                 except Exception as e:
                     log(f"[{course_name}] 本门课程出现异常，跳过: {str(e)[:150]}")
                     go_to_my_courses(page)
@@ -923,14 +1583,36 @@ def run_parallel_worker(profile_dir, dwell, max_lessons, quick, headless, q):
                     info = {"total": saved_total, "remaining": 0, "done": False}
                 # 总目标只增不减：总数固定为历史最大值（刷掉的部分通过 remaining 体现，不会让总数变小）
                 info["total"] = max(info.get("total", 0), n_target)
-                info["target"] = n_target  # 该课的视频目标条数（0 = 无视频任务）
+                info["target"] = n_target  # 该课的目标条数（视频+课件，0 = 无任务）
                 info["remaining"] = remaining
                 info["done"] = (remaining == 0)
                 info["type_dist"] = type_dist
+                if kind_cnt:
+                    info["target_split"] = kind_cnt  # 目标里视频/课件各几条
+                # 分类进度（视频/课件各自的 总数/剩余），供控制台显示「视频完成度 / 课件完成度 / 未刷」
+                old_split = info.get("kind_split") or {}
+                keys = set(old_split) | set(kind_cnt or {}) | set(kind_rem or {})
+                if keys:
+                    split = {}
+                    for k in keys:
+                        old = old_split.get(k) or {}
+                        t = max(int(old.get("total") or 0), int((kind_cnt or {}).get(k, 0) or 0))
+                        if remaining == 0:
+                            r = 0  # 已全部完成（或本课已无未完成目标）
+                        elif k in (kind_rem or {}):
+                            r = int(kind_rem[k])
+                        else:
+                            r = 0  # 该类型在本次统计里没有未完成条目 → 已刷完
+                        if t:
+                            r = min(r, t)
+                        split[k] = {"total": t, "remaining": r}
+                    info["kind_split"] = split
+                    log(f"[{course_name}] 分类进度："
+                        + " · ".join(f"{k} {v['total'] - v['remaining']}/{v['total']}" for k, v in split.items()))
                 updates[course_name] = info
                 save_progress_merge(updates)
                 if n_target == 0:
-                    status_txt = "无任务（无视频目标）"
+                    status_txt = "无任务（无视频/课件目标）"
                 elif info["done"]:
                     status_txt = "已刷完 ✓"
                 else:
@@ -947,7 +1629,7 @@ def run_parallel_worker(profile_dir, dwell, max_lessons, quick, headless, q):
     q.put((updates, total_done))
 
 
-def init_task_pool(entries, skip_no_task=False):
+def init_task_pool(entries, skip_no_task=False, kinds=TARGET_KINDS):
     """把课程列表写入共享任务池（tasks.json），供并行 worker 动态领取。
     skip_no_task=True（刷课模式）：跳过已确认无任务（target=0）的课程；
     未检查过的课程正常进池，刷课时会现场检查一次（5 次重试仍空则按无任务记录，之后跳过）。
@@ -957,16 +1639,20 @@ def init_task_pool(entries, skip_no_task=False):
         try:
             prog = load_progress()
             courses = prog.get("courses") or {}
+            saved_types = prog.get("types")
         except Exception:
-            courses = {}
-        no_task_names = {n for n, i in courses.items() if i.get("target", 0) == 0}
+            courses, saved_types = {}, None
+        if saved_types and list(saved_types) != list(kinds):
+            log(f"刷课类型已变更（{list(saved_types)} → {list(kinds)}），本次重新评估所有课程，不跳过旧记录的“无任务”课程。")
+        else:
+            no_task_names = {n for n, i in courses.items() if i.get("target", 0) == 0}
         if no_task_names:
             log(f"跳过 {len(no_task_names)} 门已确认无任务的课程（下次检查状态会重新评估）：")
             for n in sorted(no_task_names):
                 log(f"  - {n}")
     tasks = []
     for e in entries:
-        name = e["txt"].split(" ")[0]
+        name = course_name_of(e["txt"])
         if name in no_task_names:
             continue
         tasks.append(
@@ -1054,7 +1740,7 @@ def cleanup_stale_locks():
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="雨课堂自动刷课（跨课程，视频+计分+未完成）")
+    ap = argparse.ArgumentParser(description="雨课堂自动刷课（跨课程，视频+课件，只刷未完成条目）")
     ap.add_argument("--course", default=None, help="课程名（模糊匹配），只刷该课程；不填则刷所有课程")
     ap.add_argument("--dwell", type=int, default=10, help="课件每页停留秒数（默认 10，视频用不到）")
     ap.add_argument("--max-lessons", type=int, default=0, help="每门课程最多刷几个条目（0=全部）")
@@ -1063,14 +1749,27 @@ def main(argv=None):
     ap.add_argument("--quick", action="store_true", help="检查模式：遍历目标列表，不点击不播放")
     ap.add_argument("--parallel", type=int, default=1, choices=[1, 2, 3],
                     help="同时刷课的课程数（最多 3，默认 1）")
+    ap.add_argument("--types", default="video,courseware",
+                    help="刷哪些类型：video,courseware（默认两者都刷；只写 video 则只刷视频）")
     ap.add_argument("--status", action="store_true", help="只查看进度记录，不刷课")
     if argv is None:
         argv = sys.argv[1:]
     argv = [a for a in argv if a != "--auto-cli"]  # 单文件模式：剔除自身 CLI 标记
     args = ap.parse_args(argv)
 
+    raw_types = [t.strip().lower() for t in (args.types or "").split(",") if t.strip()]
+    kinds = []
+    if any(t in ("video", "视频") for t in raw_types):
+        kinds.append("视频")
+    if any(t in ("courseware", "ppt", "课件", "document") for t in raw_types):
+        kinds.append("课件")
+    if not kinds:
+        kinds = list(TARGET_KINDS)
+    kinds = tuple(kinds)
+
     log("=== 雨课堂自动刷课脚本 v7 启动 ===")
     cleanup_stale_locks()
+    write_run_lock(kinds, args.parallel)
 
     prog = load_progress()
     if args.status:
@@ -1141,8 +1840,9 @@ def main(argv=None):
         parallel = 1  # 检查模式固定单窗口，不受并行数影响
     if parallel > 1:
         ensure_parallel_profiles(parallel)
-    init_task_pool(entries, skip_no_task=not args.quick)
+    init_task_pool(entries, skip_no_task=not args.quick, kinds=kinds)
     log(f"{'并行' if parallel > 1 else '串行'}刷课：{parallel} 个窗口，动态领取课程（同一课程不会被重复领取）。")
+    log(f"本次刷课类型：{' + '.join(kinds)}（--types 可调整）")
 
     # 3) 启动 worker（并行 = 多进程动态领取；串行 = 单进程同样动态领取）
     mp_ctx = multiprocessing.get_context("spawn")
@@ -1152,7 +1852,7 @@ def main(argv=None):
         profile_dir = PROFILE_DIR if i == 0 else f"{PROFILE_DIR}_{i + 1}"
         jobs.append(mp_ctx.Process(
             target=run_parallel_worker,
-            args=(profile_dir, args.dwell, args.max_lessons, args.quick, args.headless, q),
+            args=(profile_dir, args.dwell, args.max_lessons, args.quick, args.headless, q, kinds),
             daemon=True,  # 主进程退出时子进程自动终止，防止结束/停止后残留孤儿进程
         ))
     for j in jobs:
@@ -1167,6 +1867,7 @@ def main(argv=None):
     for updates, done in results:
         final["courses"].update(updates)
         total_done += done
+    final["types"] = list(kinds)  # 记录本次刷课类型，类型变更时下次不再沿用“无任务”跳过
     save_progress(final)
     notify_done(final, total_done, len(entries))
 
@@ -1174,4 +1875,15 @@ def main(argv=None):
 if __name__ == "__main__":
     # PyInstaller 打包后 multiprocessing spawn 需要此行，否则并行子进程会重复执行主程序
     multiprocessing.freeze_support()
-    main(sys.argv[1:] if len(sys.argv) > 1 else None)
+    try:
+        main(sys.argv[1:] if len(sys.argv) > 1 else None)
+    except KeyboardInterrupt:
+        log("收到 Ctrl+C，脚本退出")
+    except Exception as e:
+        # 控制台点「结束」会直接关掉 Edge/进程，Playwright 抛 TargetClosedError，属正常收尾
+        if type(e).__name__ in ("TargetClosedError", "Error") and "closed" in str(e).lower():
+            log("浏览器已被关闭（手动结束），脚本退出")
+        else:
+            raise
+    finally:
+        clear_run_lock()
