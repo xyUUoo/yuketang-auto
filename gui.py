@@ -23,15 +23,15 @@ import webbrowser
 import auto  # 内嵌核心刷课逻辑（打包后随本程序一起分发）
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QTextCursor
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 # ---- 版本与更新检查 ----
-APP_VERSION = "1.0.13"        # 每次发新版前手动递增
+APP_VERSION = "1.0.20"        # 每次发新版前手动递增
 GITHUB_REPO = "xyUUoo/yuketang-auto"
 GITHUB_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
@@ -39,6 +39,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTO_PY = os.path.join(BASE_DIR, "auto.py")
 PROGRESS_FILE = os.path.join(BASE_DIR, "progress.json")
 PAUSE_FILE = os.path.join(BASE_DIR, "pause.flag")
+RUN_LOCK = os.path.join(BASE_DIR, "run.lock")
 IGNORE_FILE = os.path.join(BASE_DIR, "ignored_update.txt")
 LOG_FILE = os.path.join(BASE_DIR, "log.txt")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
@@ -138,8 +139,14 @@ class Console(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("雨课堂刷课控制台")
-        self.resize(980, 700)
-        self.setMinimumSize(800, 560)
+        # 控制栏一行放不下时按钮文字会被压成省略号：默认给足宽度（不超过屏幕可用宽度）
+        try:
+            avail = QGuiApplication.primaryScreen().availableGeometry()
+            win_w = min(1260, int(avail.width() * 0.9))
+        except Exception:
+            win_w = 1260
+        self.resize(max(win_w, 1000), 720)
+        self.setMinimumSize(900, 560)
 
         self.proc = None
         self.running_mode = ""
@@ -162,6 +169,11 @@ class Console(QMainWindow):
         title.setFont(QFont("Microsoft YaHei UI", 17, QFont.Weight.Bold))
         head.addWidget(title)
         head.addStretch(1)
+        # 状态文字放顶部，空间充裕，不会被挤成省略号
+        self.status_lbl = QLabel("空闲")
+        self.status_lbl.setStyleSheet("color: #2ea043; font-size: 14px; font-weight: bold;")
+        head.addWidget(self.status_lbl)
+        head.addSpacing(10)
         self.settings_btn = QPushButton("设置")
         self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.settings_btn.clicked.connect(self._open_settings)
@@ -175,7 +187,7 @@ class Console(QMainWindow):
         split = QSplitter(Qt.Orientation.Horizontal)
 
         self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["课程", "总目标", "剩余", "完成度", "状态", "类型分布"])
+        self.table.setHorizontalHeaderLabels(["课程", "视频完成度", "课件完成度", "未刷", "状态", "类型分布"])
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
@@ -205,52 +217,79 @@ class Console(QMainWindow):
 
         # ===== 控制栏 =====
         ctrl = QHBoxLayout()
+        ctrl.setSpacing(4)
+        ctrl.setContentsMargins(0, 0, 0, 0)
         ctrl.addWidget(self._mk_label("每门条数："))
         self.lessons_box = QComboBox()
         self.lessons_box.addItems(["全部", "1", "2", "3", "5", "10"])
         self.lessons_box.setCurrentIndex(0)
-        self.lessons_box.setMinimumWidth(70)
+        self.lessons_box.setMinimumWidth(0)
+        self.lessons_box.setMaximumWidth(70)
         ctrl.addWidget(self.lessons_box)
 
-        ctrl.addSpacing(12)
+        ctrl.addSpacing(6)
         ctrl.addWidget(self._mk_label("并行数："))
         self.parallel_box = QComboBox()
         self.parallel_box.addItems(["1", "2", "3"])
         self.parallel_box.setCurrentIndex(0)
-        self.parallel_box.setMinimumWidth(60)
+        self.parallel_box.setMaximumWidth(56)
         ctrl.addWidget(self.parallel_box)
 
-        ctrl.addSpacing(16)
-        self.btn_start = QPushButton("开始刷课")
-        self.btn_start.setObjectName("startBtn")
-        self.btn_start.clicked.connect(self.start)
-        ctrl.addWidget(self.btn_start)
+        ctrl.addSpacing(6)
+        ctrl.addWidget(self._mk_label("课件最长等："))
+        self.dwell_box = QComboBox()
+        self.dwell_box.addItems(["5 秒", "10 秒", "15 秒", "20 秒", "30 秒"])
+        self.dwell_box.setCurrentText("5 秒")
+        self.dwell_box.setMaximumWidth(74)
+        self.dwell_box.setToolTip("每页最多等这么久：页面“未读”标记一消失就自动翻下一页；视频用不到")
+        ctrl.addWidget(self.dwell_box)
 
+        ctrl.addSpacing(8)
+        self.btn_start_video = QPushButton("开始刷网课视频")
+        self.btn_start_video.setObjectName("startBtn")
+        self.btn_start_video.setToolTip("只刷视频类未完成条目")
+        self.btn_start_video.clicked.connect(lambda: self.start("video"))
+        self._fit_button(self.btn_start_video)
+        ctrl.addWidget(self.btn_start_video)
+
+        ctrl.addSpacing(4)
+        self.btn_start_cw = QPushButton("开始刷网课课件")
+        self.btn_start_cw.setObjectName("startBtn")
+        self.btn_start_cw.setToolTip("只刷课件（PPT/文档）类未完成条目，逐页翻到未读全消")
+        self.btn_start_cw.clicked.connect(lambda: self.start("courseware"))
+        self._fit_button(self.btn_start_cw)
+        ctrl.addWidget(self.btn_start_cw)
+
+        ctrl.addSpacing(4)
         self.btn_pause = QPushButton("暂停")
         self.btn_pause.setObjectName("pauseBtn")
         self.btn_pause.setEnabled(False)
         self.btn_pause.clicked.connect(self.toggle_pause)
+        self._fit_button(self.btn_pause)
         ctrl.addWidget(self.btn_pause)
 
+        ctrl.addSpacing(4)
         self.btn_end = QPushButton("结束")
         self.btn_end.setObjectName("stopBtn")
         self.btn_end.setEnabled(False)
         self.btn_end.clicked.connect(self.end_now)
+        self._fit_button(self.btn_end)
         ctrl.addWidget(self.btn_end)
 
+        ctrl.addSpacing(4)
         self.btn_status = QPushButton("检查状态")
         self.btn_status.setObjectName("primaryBtn")
         self.btn_status.clicked.connect(self.check_status)
+        self._fit_button(self.btn_status)
         ctrl.addWidget(self.btn_status)
 
+        ctrl.addSpacing(4)
         self.btn_refresh = QPushButton("↻ 刷新")
         self.btn_refresh.clicked.connect(self.refresh_all)
+        self._fit_button(self.btn_refresh)
         ctrl.addWidget(self.btn_refresh)
 
         ctrl.addStretch(1)
-        self.status_lbl = QLabel("空闲")
-        self.status_lbl.setStyleSheet("color: #2ea043; font-size: 14px; font-weight: bold;")
-        ctrl.addWidget(self.status_lbl)
         root.addLayout(ctrl)
 
         # 定时刷新
@@ -468,6 +507,15 @@ class Console(QMainWindow):
         lbl.setStyleSheet("color: #9aa0b4; font-size: 13px;")
         return lbl
 
+    def _fit_button(self, btn, pad=44):
+        """按文字宽度设最小宽度（按 QSS 的 13px 字号量，左右各 16px 内边距 + 余量），
+        保证按钮上的字完整显示、不被压成省略号"""
+        btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        f = QFont(btn.font())
+        f.setPixelSize(13)  # 与 QSS 中 QPushButton 的 font-size 一致
+        text_w = QFontMetrics(f).horizontalAdvance(btn.text())
+        btn.setMinimumWidth(text_w + pad)
+
     # ---------- 进度看板 ----------
     def refresh_progress(self):
         try:
@@ -494,33 +542,61 @@ class Console(QMainWindow):
             total = info.get("total", 0)
             remain = info.get("remaining", 0)
             done = bool(info.get("done"))
-            done_n = max(0, total - remain) if total else 0
+            ks = info.get("kind_split") or {}
 
             item_name = QTableWidgetItem(name)
             item_name.setForeground(QColor("#e6e6e6"))
             self.table.setItem(row, 0, item_name)
 
-            item_total = QTableWidgetItem(str(total))
-            item_total.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 1, item_total)
+            # 视频完成度 / 课件完成度：各画一条进度条（done / total）
+            ts = info.get("target_split") or {}
+            for col, kind in ((1, "视频"), (2, "课件")):
+                d = ks.get(kind) or {}
+                kt = int(d.get("total") or 0)
+                kr = int(d.get("remaining") or 0)
+                if not kt:
+                    old_total = int(ts.get(kind) or 0)
+                    txt = f"? / {old_total}" if old_total else "0 / 0"
+                    it = QTableWidgetItem(txt)
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    it.setForeground(QColor("#8a91a8"))
+                    it.setToolTip(
+                        f"本课目标里有 {old_total} 条{kind}，但还没有分类完成记录；跑一轮刷课后会显示实际完成度"
+                        if old_total else f"本课暂无{kind}目标")
+                    self.table.setItem(row, col, it)
+                    continue
+                kd = max(0, kt - kr)
+                bar = QProgressBar()
+                bar.setRange(0, 100)
+                bar.setValue(int(round(kd / kt * 100)))
+                bar.setFormat(f"{kd} / {kt}")
+                bar.setToolTip(f"{kind}：{kd} 已完成，{kr} 条未刷")
+                bar.setStyleSheet(
+                    "QProgressBar { background-color: #33364a; border: none; border-radius: 5px;"
+                    " text-align: center; color: white; font-size: 11px; min-height: 14px; }"
+                    "QProgressBar::chunk { border-radius: 5px; background-color: %s; }"
+                    % ("#2ea043" if kr == 0 else "#5b6ee1")
+                )
+                self.table.setCellWidget(row, col, bar)
 
-            item_rem = QTableWidgetItem(str(remain))
+            # 未刷：视频/课件各剩多少条
+            if ks:
+                parts = []
+                for kind in ("视频", "课件"):
+                    d = ks.get(kind) or {}
+                    if int(d.get("total") or 0):
+                        parts.append(f"{kind} {int(d.get('remaining') or 0)}")
+                rem_text = " · ".join(parts) if parts else "无"
+                zero = bool(parts) and all(
+                    int((ks.get(p.split(" ")[0]) or {}).get("remaining") or 0) == 0 for p in parts)
+            else:
+                rem_text = f"共 {remain} 条" if remain else ("无" if total else "—")
+                zero = (remain == 0 and total > 0)
+            item_rem = QTableWidgetItem(rem_text)
             item_rem.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item_rem.setForeground(QColor("#d29922" if remain else "#2ea043"))
-            self.table.setItem(row, 2, item_rem)
-
-            bar = QProgressBar()
-            ratio = (total - remain) / total if total else 0.0
-            bar.setRange(0, 100)
-            bar.setValue(int(round(ratio * 100)))
-            bar.setFormat(f"{done_n} / {total}")
-            bar.setStyleSheet(
-                "QProgressBar { background-color: #33364a; border: none; border-radius: 5px;"
-                " text-align: center; color: white; font-size: 11px; min-height: 14px; }"
-                "QProgressBar::chunk { border-radius: 5px; background-color: %s; }"
-                % ("#2ea043" if done else "#5b6ee1")
-            )
-            self.table.setCellWidget(row, 3, bar)
+            item_rem.setForeground(QColor("#2ea043" if zero else "#d29922"))
+            item_rem.setToolTip("还剩多少条视频 / 课件没刷" if ks else "旧记录：只有总剩余，跑一轮刷课后会按视频/课件拆开")
+            self.table.setItem(row, 3, item_rem)
 
             # 状态：已刷完 / 无任务 / 正在刷（仅运行中）/ 等待中
             status, st_color = "等待中", "#5b6ee1"
@@ -529,13 +605,13 @@ class Console(QMainWindow):
             elif done:
                 status, st_color = "已刷完 ✓", "#2ea043"
             elif is_running and name in running_names:
-                status, st_color = ("检查中", "#5b6ee1") if self.running_mode == "检查" else ("刷课中", "#d29922")
+                status, st_color = ("检查中", "#5b6ee1") if self.running_mode == "检查" else (f"{self.running_mode}中", "#d29922")
             item_st = QTableWidgetItem(status)
             item_st.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             item_st.setForeground(QColor(st_color))
             self.table.setItem(row, 4, item_st)
 
-            # 类型分布（视频×N 课件×N …），无记录显示 —
+            # 未完成列表的类型分布（视频×N 课件×N 作业×N …），无记录显示 —
             td = info.get("type_dist") or {}
             td_text = " ".join(f"{k}×{v}" for k, v in td.items()) if td else "—"
             item_td = QTableWidgetItem(td_text)
@@ -544,6 +620,8 @@ class Console(QMainWindow):
             self.table.setItem(row, 5, item_td)
 
         self.table.resizeColumnsToContents()
+        # 最后一列（类型分布）自适应剩余宽度，避免出现横向滚动条
+        self.table.horizontalHeader().setStretchLastSection(True)
 
     # ---------- 日志 ----------
     def refresh_log(self):
@@ -567,18 +645,55 @@ class Console(QMainWindow):
     def refresh_all(self):
         self.refresh_progress()
         self.refresh_log()
+        # 自己启动的进程已退出
         if self.proc is not None and self.proc.poll() is not None:
             self.proc = None
-            self.status_lbl.setText("空闲（上次运行已结束）")
-            self.status_lbl.setStyleSheet("color: #2ea043; font-size: 14px; font-weight: bold;")
-            self.btn_pause.setText("暂停")
-            self.btn_pause.setEnabled(False)
             self.btn_end.setEnabled(False)
-        elif self.proc is not None:
-            mode_txt = "检查中…" if getattr(self, "running_mode", "") == "检查" else "刷课中…"
+        ext = self._external_runner()
+        if self.proc is not None:
+            mode_txt = "检查中…" if getattr(self, "running_mode", "") == "检查" else f"{self.running_mode or '刷课'}中…"
             mode_color = "#5b6ee1" if getattr(self, "running_mode", "") == "检查" else "#d29922"
             self.status_lbl.setText(mode_txt)
             self.status_lbl.setStyleSheet(f"color: {mode_color}; font-size: 14px; font-weight: bold;")
+        elif ext:
+            # 命令行/其他窗口启动的刷课任务：照样用这三个按钮控制
+            self.status_lbl.setText(f"外部任务运行中（PID {ext['pid']}）")
+            self.status_lbl.setStyleSheet("color: #d29922; font-size: 14px; font-weight: bold;")
+            self.btn_end.setEnabled(True)
+        else:
+            self.status_lbl.setText("空闲（上次运行已结束）")
+            self.status_lbl.setStyleSheet("color: #2ea043; font-size: 14px; font-weight: bold;")
+            self.btn_end.setEnabled(False)
+        self._sync_pause_button()
+
+    def _sync_pause_button(self):
+        """暂停按钮文字/可用状态跟 pause.flag 实际情况保持一致"""
+        running = (self.proc is not None and self.proc.poll() is None) or self._external_runner() is not None
+        self.btn_pause.setText("继续" if os.path.exists(PAUSE_FILE) else "暂停")
+        self.btn_pause.setEnabled(bool(running))
+
+    def _external_runner(self):
+        """读取 run.lock，返回仍在运行的外部刷课任务（dict），没有则 None"""
+        if self.proc is not None and self.proc.poll() is None:
+            return None
+        try:
+            with open(RUN_LOCK, "r", encoding="utf-8", errors="replace") as f:
+                info = json.load(f)
+        except Exception:
+            return None
+        pid = info.get("pid")
+        if not isinstance(pid, int) or pid == os.getpid():
+            return None
+        try:
+            import psutil
+            if not psutil.pid_exists(pid):
+                return None
+            cmd = " ".join(psutil.Process(pid).cmdline())
+            if "yuketang" not in cmd and "auto.py" not in cmd:
+                return None
+        except Exception:
+            return None
+        return info
 
     # ---------- 控制 ----------
     def launch_runner(self, extra_args, mode_label):
@@ -603,14 +718,22 @@ class Console(QMainWindow):
         self.btn_end.setEnabled(True)
         return True
 
-    def start(self):
-        """刷课模式：完整播放每个视频"""
+    def start(self, kinds="video,courseware"):
+        """刷课模式：kinds 决定只刷视频还是只刷课件（两个按钮各自调用）"""
         if self.proc is not None and self.proc.poll() is None:
             self.append_log_note("已有任务在运行，请先点“结束”。")
+            return
+        ext = self._external_runner()
+        if ext:
+            self.append_log_note(
+                f"已有外部任务在运行（PID {ext['pid']}，{ext.get('start', '')} 启动），"
+                f"可用「暂停」「结束」控制它，或先「结束」再重新开始。"
+            )
             return
         if not FROZEN and not os.path.exists(AUTO_PY):
             self.append_log_note(f"找不到脚本：{AUTO_PY}")
             return
+        only_txt = "视频" if kinds == "video" else ("课件" if kinds == "courseware" else "视频+课件")
         # 首次运行（还没有任何进度记录）：建议先检查状态
         if not self._has_progress():
             msg = QMessageBox()
@@ -618,7 +741,7 @@ class Console(QMainWindow):
             msg.setIcon(QMessageBox.Icon.Information)
             msg.setText(
                 "首次运行前建议先「检查状态」\n\n"
-                "检查会刷新课程与未完成数量，避免误判“已刷完”。"
+                "检查会刷新课程与未完成数量（视频 / 课件），避免误判“已刷完”。"
             )
             btn_check = msg.addButton("去检查状态", QMessageBox.ButtonRole.AcceptRole)
             btn_direct = msg.addButton("直接刷课", QMessageBox.ButtonRole.RejectRole)
@@ -628,15 +751,17 @@ class Console(QMainWindow):
                 return
         n = self.lessons_box.currentText()
         pn = self.parallel_box.currentText()
-        extra = []
+        dwell = self.dwell_box.currentText().split(" ")[0]
+        extra = ["--dwell", dwell, "--types", kinds]
         if n != "全部":
             extra += ["--max-lessons", n]
         if pn != "1":
             extra += ["--parallel", pn]
-        if not self.launch_runner(extra, f"刷课模式，每门 {n} 条，并行 {pn} 窗口"):
+        label = f"刷{only_txt}模式，每门 {n} 条，课件每页最长等 {dwell}s，并行 {pn} 窗口"
+        if not self.launch_runner(extra, label):
             return
-        self.running_mode = "刷课"
-        self.status_lbl.setText("刷课中…")
+        self.running_mode = f"刷{only_txt}"
+        self.status_lbl.setText(f"刷{only_txt}中…")
         self.status_lbl.setStyleSheet("color: #d29922; font-size: 14px; font-weight: bold;")
 
     def _has_progress(self):
@@ -651,10 +776,14 @@ class Console(QMainWindow):
         if self.proc is not None and self.proc.poll() is None:
             self.append_log_note("已有任务在运行，请先点“结束”。")
             return
+        ext = self._external_runner()
+        if ext:
+            self.append_log_note(f"已有外部任务在运行（PID {ext['pid']}），请先「结束」它。")
+            return
         if not FROZEN and not os.path.exists(AUTO_PY):
             self.append_log_note(f"找不到脚本：{AUTO_PY}")
             return
-        if not self.launch_runner(["--quick"], "检查模式：遍历刷新进度，不播放"):
+        if not self.launch_runner(["--quick", "--types", "video,courseware"], "检查模式：遍历刷新进度，不播放"):
             return
         self.running_mode = "检查"
         self.status_lbl.setText("检查中…")
@@ -682,6 +811,24 @@ class Console(QMainWindow):
     def end_now(self):
         """结束：彻底关闭刷课脚本 + 所有刷课用的 Edge 浏览器 + 残留进程"""
         self._clear_pause()
+        ext = self._external_runner()
+        if ext:
+            try:
+                import psutil
+                p = psutil.Process(ext["pid"])
+                for child in p.children(recursive=True):
+                    try:
+                        child.terminate()
+                    except Exception:
+                        pass
+                p.terminate()
+                try:
+                    p.wait(timeout=8)
+                except Exception:
+                    p.kill()
+            except Exception:
+                pass
+            self.append_log_note(f"已结束后台任务（PID {ext['pid']}）。")
         self.stop()
         self.btn_pause.setText("暂停")
         self.btn_pause.setEnabled(False)
@@ -699,26 +846,36 @@ class Console(QMainWindow):
         """进程树清理（psutil 原生，不依赖 PowerShell）：
         1) auto-cli / multiprocessing-fork 的刷课脚本进程
         2) 刷课 Edge（命令行含 edge_profile）
-        3) python + yuketang 残留"""
+        3) 跑了 auto.py 的 python 残留
+        注意：绝不杀控制台自己及其父进程（源码模式 gui.py 的命令行同样含 yuketang）"""
         try:
             import psutil
         except Exception:
             self._run_cleanup_ps()
             return
+        protected = {os.getpid()}
+        try:
+            protected |= {p.pid for p in psutil.Process().parents()}
+        except Exception:
+            pass
         killed = []
         try:
             for proc in psutil.process_iter(["name", "cmdline"]):
+                if proc.pid in protected:
+                    continue
                 try:
                     name = (proc.info["name"] or "").lower()
                     cmd = " ".join(proc.info["cmdline"] or [])
                 except Exception:
+                    continue
+                if not cmd:
                     continue
                 hit = False
                 if "yuketang" in name and ("--auto-cli" in cmd or "--multiprocessing-fork" in cmd):
                     hit = True
                 elif name == "msedge.exe" and "edge_profile" in cmd:
                     hit = True
-                elif name.startswith("python") and "yuketang" in cmd:
+                elif name.startswith("python") and "auto.py" in cmd:
                     hit = True
                 if hit:
                     try:
@@ -763,6 +920,11 @@ foreach ($p in $ms) { & taskkill /f /t /pid $p.ProcessId 2>$null | Out-Null }
                 pass
         self.proc = None
         self._run_cleanup()
+        try:
+            if os.path.exists(RUN_LOCK):
+                os.remove(RUN_LOCK)
+        except Exception:
+            pass
         self.status_lbl.setText("已停止")
         self.status_lbl.setStyleSheet("color: #2ea043; font-size: 14px; font-weight: bold;")
         self.append_log_note("已手动停止，并清理了残留进程。")
