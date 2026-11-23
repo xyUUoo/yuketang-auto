@@ -663,14 +663,16 @@ def study_course(page, context, entry, dwell, max_lessons, quick=False):
     # 解析待办（异步加载，0 条时重试；页面显示“暂无未完成”则直接跳过）
     all_items, targets, state = refresh_todo_list(page)
     log(f"[{course_name}] 待办共 {len(all_items)} 条，目标（视频+计分+未完成）：{len(targets)} 条")
-    # 未完成条目类型分布（视频/课件/作业/其他，按页面原始类型文字统计）
+    # 未完成「计分」条目类型分布：只统计带"计分"标记的条目，不计分的不进分布
     type_cnt = {}
     for it in all_items:
+        if not it.get("scored"):
+            continue
         t = it.get("type", "其他") or "其他"
         type_cnt[t] = type_cnt.get(t, 0) + 1
     if type_cnt:
         dist = " · ".join(f"{k}×{v}" for k, v in type_cnt.items())
-        log(f"[{course_name}] 未完成类型分布：{dist}")
+        log(f"[{course_name}] 未完成类型分布（计分）：{dist}")
     for i, t in enumerate(targets[:10]):
         log(f"  [{i}] {t['name']} ({t['status']})")
     if len(targets) > 10:
@@ -914,19 +916,26 @@ def run_parallel_worker(profile_dir, dwell, max_lessons, quick, headless, q):
                     continue
                 info = updates.get(course_name)
                 if info is None:
-                    # 第一次写这课：读 progress.json 里已存的总数，避免把"总数"覆盖成当次未完成数
-                    saved_total = 0
+                    # 第一次写这课：读 progress.json 里已存的总数/分类型基线，避免覆盖丢了
+                    saved = {}
                     try:
-                        saved_total = (load_progress().get("courses", {}).get(course_name, {}) or {}).get("total", 0) or 0
+                        saved = load_progress().get("courses", {}).get(course_name, {}) or {}
                     except Exception:
-                        pass
-                    info = {"total": saved_total, "remaining": 0, "done": False}
+                        saved = {}
+                    info = {"total": saved.get("total", 0) or 0, "remaining": 0, "done": False,
+                            "type_base": saved.get("type_base") or {}}
                 # 总目标只增不减：总数固定为历史最大值（刷掉的部分通过 remaining 体现，不会让总数变小）
                 info["total"] = max(info.get("total", 0), n_target)
                 info["target"] = n_target  # 该课的视频目标条数（0 = 无视频任务）
                 info["remaining"] = remaining
                 info["done"] = (remaining == 0)
                 info["type_dist"] = type_dist
+                # 分类型基线（各类型的"总数"）：只增不减，首次见到该类型时以当时剩余数为基准，
+                # 之后 GUI 用 基线 - 当前剩余 得到"该类已刷多少"。页面只给未完成列表，没有基线算不出完成数。
+                base = info.get("type_base") or {}
+                for k, v in (type_dist or {}).items():
+                    base[k] = max(int(base.get(k, 0) or 0), int(v))
+                info["type_base"] = base
                 updates[course_name] = info
                 save_progress_merge(updates)
                 if n_target == 0:
@@ -1023,22 +1032,61 @@ def claim_next_task(worker_tag):
                 pass
 
 
+def sync_profile_auth(src, dst):
+    """把主 profile 的登录态覆盖到副本（cookie + 解密 key + localStorage）。
+
+    Chromium 的 cookie 用 Local State 里的 os_crypt key 加密，两者必须同源，
+    所以一起覆盖；Local Storage 的 LevelDB 整目录替换，避免新旧 .ldb 混在一起。
+    """
+    os.makedirs(dst, exist_ok=True)
+    for rel in ("Local State", os.path.join("Default", "Network", "Cookies")):
+        s = os.path.join(src, rel)
+        d = os.path.join(dst, rel)
+        if not os.path.exists(s):
+            continue
+        os.makedirs(os.path.dirname(d) or dst, exist_ok=True)
+        shutil.copy2(s, d)
+
+    src_ls = os.path.join(src, "Default", "Local Storage")
+    dst_ls = os.path.join(dst, "Default", "Local Storage")
+    if os.path.isdir(src_ls):
+        shutil.rmtree(dst_ls, ignore_errors=True)
+        shutil.copytree(src_ls, dst_ls, dirs_exist_ok=True)
+
+    # 清掉副本里可能残留的 SQLite 事务日志，否则新库会被旧事务污染
+    for name in ("Cookies-journal", "Cookies-wal", "Cookies-shm"):
+        p = os.path.join(dst, "Default", "Network", name)
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
 def ensure_parallel_profiles(parallel):
-    """并行模式：把主登录态 profile 复制出 edge_profile_2/3（cookie 一起复制，无需重新扫码）"""
+    """并行模式：确保 edge_profile_2/3 的登录态与主 profile 一致。
+
+    注意：副本「已存在」也必须重新同步。早期版本只在副本不存在的第一次复制，
+    副本停在三周前的 cookie 上，打开就是登录页，逼着用户重新扫码。
+    """
     for i in range(2, parallel + 1):
         dst = f"{PROFILE_DIR}_{i}"
-        if os.path.exists(dst):
-            log(f"【profile】{os.path.basename(dst)} 已存在，直接复用。")
-            continue
-        log(f"【profile】正在复制登录态 → {os.path.basename(dst)} ……")
+        if not os.path.exists(dst):
+            log(f"【profile】首次创建登录态副本 → {os.path.basename(dst)} ……")
+            try:
+                time.sleep(1)  # 等主 profile 的 Edge 完全释放
+                shutil.copytree(
+                    PROFILE_DIR, dst,
+                    ignore=shutil.ignore_patterns("Singleton*", "*.lock", "lockfile"),
+                )
+            except Exception as e:
+                log(f"【profile】复制失败: {str(e)[:150]}")
+                continue
         try:
-            time.sleep(1)  # 等主 profile 的 Edge 完全释放
-            shutil.copytree(
-                PROFILE_DIR, dst,
-                ignore=shutil.ignore_patterns("Singleton*", "*.lock", "lockfile"),
-            )
+            sync_profile_auth(PROFILE_DIR, dst)
+            log(f"【profile】{os.path.basename(dst)} 登录态已与主 profile 同步（无需重新扫码）")
         except Exception as e:
-            log(f"【profile】复制失败: {str(e)[:150]}")
+            log(f"【profile】{os.path.basename(dst)} 同步失败: {str(e)[:150]}")
 
 
 def cleanup_stale_locks():
